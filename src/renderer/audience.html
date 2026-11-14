@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<title>Publik</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' hpres:; style-src 'self' 'unsafe-inline'; frame-src hpres: about:;">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: default; }
+  body.idle, body.idle * { cursor: none !important; }
+  #stage { position: absolute; inset: 0; }
+  .sv { position: relative; overflow: hidden; }
+  .sv-frame { position: absolute; left: 50%; top: 50%; border: 0; transform-origin: center center; background: transparent; }
+  .sv-loading .sv-frame { opacity: 0; }
+  #cover { position: absolute; inset: 0; z-index: 5; display: none; place-items: center; color: #777; font: 18px -apple-system, sans-serif; }
+  #cover.black { display: grid; background: #000; }
+  #cover.white { display: grid; background: #fff; }
+  #cover.ended { display: grid; background: #000; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="cover"></div>
+<script type="module" src="audience.js"></script>
+
+</body>
+</html>

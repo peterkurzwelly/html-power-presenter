@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="sv"><head><meta charset="utf-8"><title>Shadow-deck (test)</title>
+<style>
+  body { margin:0; background:#222; }
+  my-deck section { background:#f4efe6; color:#111; font: 64px/1.2 Georgia, serif; padding: 120px; box-sizing:border-box; }
+  my-deck section.dark { background:#111; color:#f4efe6; }
+  h1 { margin:0 0 30px; font-size: 96px; }
+</style></head>
+<body>
+<my-deck width="1920" height="1080">
+  <section><h1>Första sliden</h1><p>En webbkomponent med <b>shadow DOM</b> och skalning.</p><aside class="notes">Anteckning ett.</aside></section>
+  <section class="dark"><h1>Andra sliden</h1><p>Text som går att redigera.</p></section>
+  <section><h1>Tredje sliden</h1><p>Slut.</p></section>
+</my-deck>
+<script>
+customElements.define('my-deck', class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>
+      :host { position: fixed; inset: 0; display: grid; place-items: center; background: #333; }
+      .canvas { width: 1920px; height: 1080px; transform: scale(.42); position: relative; overflow: hidden; }
+      ::slotted(section) { position: absolute; inset: 0; display: none; }
+      ::slotted(section.active) { display: block; }
+      .controls { position: absolute; bottom: 20px; left: 50%; background: red; color: #fff; padding: 10px 30px; font: 20px sans-serif; }
+    </style><div class="canvas"><slot></slot></div><div class="controls">DECKETS EGNA KNAPPAR ◀ ▶</div>`;
+    this.i = 0;
+  }
+  connectedCallback() {
+    requestAnimationFrame(() => this.go(0));
+    document.addEventListener('keydown', (e) => { if (e.key === 'ArrowRight') this.go(this.i + 1); });
+  }
+  go(i) { const s = [...this.querySelectorAll(':scope > section')]; this.i = Math.max(0, Math.min(s.length - 1, i)); s.forEach((x, j) => x.classList.toggle('active', j === this.i)); }
+});
+</script>
+</body></html>

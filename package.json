@@ -1,0 +1,40 @@
+{
+  "name": "html-presenter",
+  "productName": "HTML Presenter",
+  "version": "1.0.0",
+  "description": "Desktop app for HTML presentations: presenter view on two screens, slide grid and in-place text editing.",
+  "author": "Peter Kurzwelly",
+  "homepage": "https://github.com/peterkurzwelly/html-power-presenter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/peterkurzwelly/html-power-presenter.git"
+  },
+  "keywords": [
+    "presentation",
+    "slides",
+    "presenter-view",
+    "html",
+    "electron",
+    "macos"
+  ],
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "src/main/main.mjs",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dual": "HP_FAKE_DUAL=1 electron .",
+    "test": "node scripts/smoke-test.mjs",
+    "package": "node scripts/package.mjs",
+    "install-app": "node scripts/package.mjs --install"
+  },
+  "dependencies": {
+    "parse5": "^8.0.1"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.1.0",
+    "playwright": "1.64"
+  }
+}

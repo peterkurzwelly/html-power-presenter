@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<title>HTML Presenter</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' hpres:; img-src 'self' hpres: data: blob:; style-src 'self' 'unsafe-inline'; frame-src hpres: about:;">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============================== START ============================== -->
+<section id="start" class="screen start">
+  <div class="drag-strip"></div>
+  <div class="start-inner">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><span></span><span></span></div>
+      <div>
+        <h1>HTML Presenter</h1>
+        <p>Visa, presentera och finjustera dina HTML-presentationer.</p>
+      </div>
+    </div>
+    <div id="drop" class="drop">
+      <div class="drop-icon" aria-hidden="true">⇩</div>
+      <p><strong>Släpp en HTML-fil här</strong> eller</p>
+      <button id="openBtn" class="btn primary">Öppna fil…</button>
+      <p class="hint">⌘O · Högerklicka en .html-fil i Finder → Öppna med → HTML Presenter</p>
+    </div>
+    <section class="recent">
+      <h2>Senast öppnade</h2>
+      <ul id="recentList"></ul>
+      <p id="recentEmpty" class="muted" hidden>Inga filer ännu.</p>
+    </section>
+  </div>
+</section>
+
+<!-- ============================ WORKSPACE ============================ -->
+<section id="workspace" class="screen workspace" hidden>
+  <header class="toolbar">
+    <div class="tb-group tb-doc">
+      <button id="homeBtn" class="icon-btn" title="Startsidan">⌂</button>
+      <div class="doc" title="">
+        <span id="docName" class="doc-name"></span>
+        <span id="dirtyMark" class="dirty" hidden>Ändrad</span>
+      </div>
+    </div>
+
+    <div class="tb-group">
+      <div class="seg" role="tablist">
+        <button data-view="normal" class="active" title="Normal (⌘1)">Normal</button>
+        <button data-view="grid" title="Rutnät (⌘2)">Rutnät</button>
+      </div>
+      <button id="editBtn" class="btn toggle" title="Redigeringsläge (⌘E)">✎ Redigera</button>
+      <div class="tb-sep"></div>
+      <button id="undoBtn" class="icon-btn" title="Ångra (⌘Z)" disabled>↶</button>
+      <button id="redoBtn" class="icon-btn" title="Gör om (⇧⌘Z)" disabled>↷</button>
+      <button id="saveBtn" class="btn" title="Spara (⌘S)" disabled>Spara</button>
+    </div>
+
+    <div class="tb-group tb-right">
+      <button id="rehearseBtn" class="btn" title="Öva med presentatörsvy (⌥⌘↩)">Presentatörsvy</button>
+      <button id="presentBtn" class="btn primary" title="Presentera från aktuell slide (⌘↩) · från början (⇧⌘↩)">▶ Presentera</button>
+    </div>
+  </header>
+
+  <div class="ws-body">
+    <aside id="sidebar" class="sidebar">
+      <ol id="thumbList" class="thumb-list"></ol>
+    </aside>
+
+    <main id="normalView" class="normal">
+      <div id="editBar" class="editbar" hidden>
+        <span class="eb-dot"></span>
+        <span><b>Redigeringsläge</b> — klicka i en text för att ändra den. <kbd>⌥</kbd>-klick markerar ett helt element (t.ex. en bild eller ruta). <kbd>⌫</kbd> tar bort det markerade. <kbd>Esc</kbd> avslutar textredigeringen.</span>
+        <button id="editDone" class="btn small">Klar</button>
+      </div>
+      <div id="stageWrap" class="stage-wrap">
+        <div id="stage" class="stage"></div>
+        <div id="stageMsg" class="stage-msg" hidden></div>
+      </div>
+      <div id="notesPane" class="notes-pane">
+        <div class="notes-head"><span id="notesTitle">Anteckningar</span></div>
+        <div id="notesText" class="notes-text"></div>
+      </div>
+    </main>
+
+    <main id="gridView" class="grid-view" hidden>
+      <div class="grid-tools">
+        <span id="gridInfo" class="muted"></span>
+        <label class="zoom">Storlek <input id="gridSize" type="range" min="160" max="520" step="10" value="280"></label>
+      </div>
+      <ol id="gridList" class="grid-list"></ol>
+    </main>
+  </div>
+
+  <footer class="statusbar">
+    <span id="statusLeft"></span>
+    <span id="statusMid" class="muted"></span>
+    <span id="statusRight" class="muted"></span>
+  </footer>
+
+  <div id="selTools" class="sel-tools" hidden>
+    <span id="selLabel" class="sel-label"></span>
+    <button id="selEdit" class="btn small">Redigera text</button>
+    <button id="selParent" class="btn small" title="Markera elementet runt (⌥↑)">↑ Yttre element</button>
+    <button id="selDelete" class="btn small danger" title="Ta bort (⌫)">Ta bort</button>
+  </div>
+</section>
+
+<!-- ============================ PRESENTER ============================ -->
+<section id="presenter" class="screen presenter" hidden>
+  <header class="p-top">
+    <div class="p-timer">
+      <span id="pTimer" class="p-time">0:00</span>
+      <button id="pPause" class="icon-btn" title="Pausa/fortsätt timer">⏸</button>
+      <button id="pReset" class="icon-btn" title="Nollställ timer (T)">↺</button>
+    </div>
+    <div id="pClock" class="p-clock"></div>
+    <div id="pCount" class="p-count"></div>
+    <div class="p-spacer"></div>
+    <button id="pBlack" class="btn" title="Svart skärm (B)">Svart</button>
+    <button id="pWhite" class="btn" title="Vit skärm (W)">Vit</button>
+    <button id="pGridBtn" class="btn" title="Alla slides (G)">Alla slides</button>
+    <button id="pSwap" class="btn" title="Byt vilken skärm som visar vad">Byt skärmar</button>
+    <button id="pEnd" class="btn danger" title="Avsluta (Esc)">Avsluta</button>
+  </header>
+
+  <div class="p-main">
+    <section class="p-current">
+      <div class="p-stage-box">
+        <div id="pCurStage" class="p-stage"></div>
+        <div id="pCurOverlay" class="p-overlay" hidden></div>
+      </div>
+      <div class="p-nav">
+        <button id="pPrev" class="btn" title="Föregående (←)">◀ Föregående</button>
+        <button id="pNext" class="btn primary" title="Nästa (→ / mellanslag)">Nästa ▶</button>
+      </div>
+    </section>
+    <section class="p-side">
+      <div class="p-label">Nästa</div>
+      <div class="p-next-box">
+        <div id="pNextStage" class="p-stage"></div>
+        <div id="pNextEnd" class="p-overlay" hidden>Slut på bildspelet</div>
+      </div>
+      <div class="p-notes-head">
+        <span>Anteckningar</span>
+        <span>
+          <button id="pFontDown" class="icon-btn" title="Mindre text">A−</button>
+          <button id="pFontUp" class="icon-btn" title="Större text">A+</button>
+        </span>
+      </div>
+      <div id="pNotes" class="p-notes"></div>
+    </section>
+  </div>
+
+  <footer class="p-strip"><ol id="pStrip" class="strip-list"></ol></footer>
+
+  <div id="pGridOverlay" class="p-grid-overlay" hidden>
+    <div class="p-grid-head"><span>Alla slides — klicka för att hoppa dit</span><button id="pGridClose" class="btn small">Stäng (G)</button></div>
+    <ol id="pGridList" class="grid-list"></ol>
+  </div>
+  <div id="pBanner" class="p-banner" hidden></div>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
