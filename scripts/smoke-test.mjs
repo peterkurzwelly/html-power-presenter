@@ -1,8 +1,10 @@
-// Röktest: startar appen med Playwright, öppnar ett deck (en kopia), tar skärmdumpar
-// av normalvy, rutnät, redigering och presentatörsläge, och kontrollerar att en
-// textändring sparas utan att resten av filen rörs.
+// End-to-end test: drives the real app with Playwright on a COPY of a deck and exits
+// non-zero if anything is wrong. Covers views, thumbnails, editing and saving,
+// deleting and undo, reordering, importing slides from another deck (copy and
+// move), the deck's file sandbox, and presenting with an audience window.
 //
-//   node scripts/smoke-test.mjs <deck.html> [utmapp]
+//   node scripts/smoke-test.mjs <deck.html> [out-dir]
+//   HP_EXEC=<path to built app binary> node scripts/smoke-test.mjs …   (test the packaged app)
 
 import { _electron as electron } from 'playwright';
 import fs from 'node:fs';
@@ -13,142 +15,333 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const src = process.argv[2];
 const out = path.resolve(process.argv[3] || path.join(os.tmpdir(), 'hp-smoke'));
-if (!src) { console.error('Ange en deck-fil.'); process.exit(1); }
+if (!src) { console.error('Usage: node scripts/smoke-test.mjs <deck.html> [out-dir]'); process.exit(2); }
+fs.rmSync(out, { recursive: true, force: true });
 fs.mkdirSync(out, { recursive: true });
 
-// Kopian läggs i en egen mapp med samma filnamn. En fil utanför mappen och en
-// innanför används för att kontrollera att decket bara kommer åt sin egen mapp.
+/* ------------------------------------------------------------------ fixtures */
+
+// The deck under test, in its own folder, plus files to probe the sandbox with.
 const deckDir = path.join(out, 'deck');
 fs.mkdirSync(deckDir, { recursive: true });
 const deck = path.join(deckDir, path.basename(src));
 fs.copyFileSync(src, deck);
-fs.writeFileSync(path.join(out, 'outside.txt'), 'hemligt');
+fs.writeFileSync(path.join(out, 'outside.txt'), 'secret');
 fs.writeFileSync(path.join(deckDir, 'inside.txt'), 'ok');
+fs.writeFileSync(path.join(deckDir, 'inner.html'), '<!doctype html><body>inner ok</body>');
+fs.symlinkSync(out, path.join(deckDir, 'escape-link'));
 const original = fs.readFileSync(deck, 'utf8');
 
+// A second deck in another folder, with a different design and an image file, to import from.
+const otherDir = path.join(out, 'other');
+fs.mkdirSync(path.join(otherDir, 'img'), { recursive: true });
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==', 'base64');
+fs.writeFileSync(path.join(otherDir, 'img', 'dot.png'), PNG);
+const other = path.join(otherDir, 'other-deck.html');
+fs.writeFileSync(other, `<!doctype html><html><head><meta charset="utf-8"><title>Other</title><style>
+:root { --brand: rgb(200, 30, 90); }
+body { margin: 0; font-family: Georgia, serif; color: rgb(20, 20, 20); }
+.page { position: absolute; inset: 0; width: 1280px; height: 720px; display: none; background: rgb(250, 240, 220); padding: 60px; box-sizing: border-box; }
+.page.current { display: block; }
+.page h1 { color: var(--brand); font-size: 80px; margin: 0; }
+.badge { display: inline-block; border: 4px solid var(--brand); padding: 10px 20px; font-size: 30px; }
+</style></head><body><div class="deck">
+<div class="page" data-title="Other one"><h1>Imported title</h1><span class="badge">badge</span><img src="img/dot.png" width="40" height="40"></div>
+<div class="page" data-title="Other two"><h1>Second other</h1></div>
+<div class="page" data-title="Other three"><h1>Third other</h1></div>
+</div>
+<script type="application/json" id="speaker-notes">["note one", "note two", "note three"]</script>
+</body></html>`);
+const otherOriginal = fs.readFileSync(other, 'utf8');
+
+/* --------------------------------------------------------------------- helpers */
+
+let failures = 0;
+const check = (ok, label, detail = '') => {
+  console.log(`${ok ? '✓' : '✗'} ${label}${detail ? ' — ' + detail : ''}`);
+  if (!ok) { failures++; process.exitCode = 1; }
+};
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const shot = async (page, name) => { const p = path.join(out, name + '.png'); await page.screenshot({ path: p }); console.log('📸', p); };
+const shot = async (target, name) => { await target.screenshot({ path: path.join(out, name + '.png') }); };
 
 const app = await electron.launch({
-  // HP_EXEC = sökväg till en byggd app, för att testa paketet i stället för källkoden.
   ...(process.env.HP_EXEC ? { executablePath: process.env.HP_EXEC, args: [deck] } : { args: [root, deck] }),
   env: { ...process.env, HP_FAKE_DUAL: '1', HP_USER_DATA: path.join(out, 'userdata') },
 });
-app.process().stdout.on('data', (d) => process.stdout.write('[main] ' + d));
-app.process().stderr.on('data', (d) => { const s = String(d); if (!/Electron Security Warning|DevTools/.test(s)) process.stderr.write('[main!] ' + s); });
+app.process().stderr.on('data', (d) => { const s = String(d); if (/Error|error:/.test(s) && !/Security Warning|DevTools|Debugger/.test(s)) process.stderr.write('[main] ' + s); });
 
 const page = await app.firstWindow();
-page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log('[renderer]', m.type(), m.text()); });
-page.on('pageerror', (e) => console.log('[renderer pageerror]', e.message));
-
+page.on('pageerror', (e) => { check(false, 'no page errors in the main window', e.message); });
+if (process.env.HP_VERBOSE) page.on('console', (m) => { if (m.type() === 'error') console.log('  [console]', m.text(), m.location().url || ''); });
 await page.setViewportSize({ width: 1440, height: 900 }).catch(() => {});
-await page.waitForSelector('#workspace:not([hidden])', { timeout: 20000 });
-await page.waitForFunction(() => document.querySelectorAll('#thumbList li').length > 0, null, { timeout: 20000 });
-const n = await page.$$eval('#thumbList li', (l) => l.length);
-console.log('slides:', n, '| status:', await page.textContent('#statusMid'));
 
-// Filåtkomst: decket ska nå sin egen mapp men inte filer utanför.
-const access = await page.frames().find((f) => f.url().includes('hp=main')).evaluate(async () => {
-  const get = (u) => fetch(u).then((r) => r.status).catch(() => 'fel');
-  return { inside: await get('inside.txt'), outside: await get('../outside.txt'), system: await get('/fs/etc/hosts') };
-});
-console.log('filåtkomst — inuti:', access.inside, '| utanför:', access.outside, '| /etc/hosts:', access.system);
+const mainFrame = () => page.frames().find((f) => f.url().includes('hp=main'));
+const sidebarTitles = () => page.$$eval('#thumbList .thumb .ph', (els) => els.map((e) => e.textContent));
+const slideCount = () => page.$$eval('#thumbList li', (l) => l.length);
+const status = () => page.textContent('#statusLeft');
+const menu = (action) => app.evaluate(({ BrowserWindow }, a) => {
+  const w = BrowserWindow.getAllWindows().find((x) => x.webContents.getURL().includes('/ui/index.html'));
+  w.webContents.send('menu', a);
+}, action);
+const waitReload = async (count) => {
+  await page.waitForFunction((n) => document.querySelectorAll('#thumbList li').length === n && !document.querySelector('#stage.sv-loading'), count, { timeout: 20000 });
+  await wait(500);
+};
+const clickInSlide = async (x, y, mods = []) => {
+  const fr = await page.$eval('#stage iframe', (f) => { const r = f.getBoundingClientRect(); return { left: r.left, top: r.top, s: r.width / f.offsetWidth }; });
+  for (const m of mods) await page.keyboard.down(m);
+  await page.mouse.click(fr.left + x * fr.s, fr.top + y * fr.s);
+  for (const m of mods) await page.keyboard.up(m);
+};
 
-// Vänta på miniatyrer
+/* ------------------------------------------------------------------ open & view */
+
+await page.waitForFunction(() => document.querySelectorAll('#thumbList li').length > 0, null, { timeout: 30000 });
+const n0 = await slideCount();
+check(n0 >= 2, 'deck opens with slides', `${n0} slides, ${await page.textContent('#statusMid')}`);
+
 const t0 = Date.now();
-await page.waitForFunction((n) => document.querySelectorAll('#thumbList .thumb img').length >= Math.min(n, 6), n, { timeout: 60000 });
-console.log('första miniatyrerna efter', Date.now() - t0, 'ms');
-await wait(600);
+const thumbsOk = await page.waitForFunction((n) => document.querySelectorAll('#thumbList .thumb img').length >= n, n0, { timeout: 90000 }).then(() => true, () => false);
+check(thumbsOk, 'thumbnails render for every slide', `${Date.now() - t0} ms`);
+
 await page.keyboard.press('ArrowRight');
-await wait(700);
-console.log('efter →:', await page.textContent('#statusLeft'));
+await wait(500);
+check((await status()) === `Slide 2 av ${n0}`, 'arrow key moves to the next slide', await status());
 await shot(page, '1-normal');
 
-// Rutnät
 await page.click('.seg button[data-view="grid"]');
-await page.waitForFunction((n) => document.querySelectorAll('#gridList .thumb img').length >= n, n, { timeout: 90000 }).catch(() => console.log('alla miniatyrer hann inte bli klara'));
-console.log('alla miniatyrer efter', Date.now() - t0, 'ms');
 await wait(300);
+check(await page.isVisible('#gridView'), 'grid view opens');
 await shot(page, '2-grid');
 await page.click('.seg button[data-view="normal"]');
 
-// Redigering: klicka i första rubriken på aktuell slide och lägg till text
+/* ------------------------------------------------------------------- sandbox */
+
+const probe = await mainFrame().evaluate(async () => {
+  const get = (u) => fetch(u).then((r) => r.status).catch(() => 'error');
+  let parentApi;
+  try { parentApi = typeof window.parent.hp; } catch (_) { parentApi = 'blocked'; }
+  let parentDom;
+  try { parentDom = !!window.parent.document; } catch (_) { parentDom = 'blocked'; }
+  return {
+    inside: await get('inside.txt'),
+    outside: await get('../outside.txt'),
+    system: await get('/fs/etc/hosts'),
+    symlink: await get('escape-link/outside.txt'),
+    parentApi, parentDom,
+  };
+});
+check(probe.inside === 200, 'deck can read files in its own folder', String(probe.inside));
+check(probe.outside === 403 && probe.system === 403, 'deck cannot read files outside its folder', `${probe.outside}, ${probe.system}`);
+check(probe.symlink === 403 || probe.symlink === 404, 'a symlink in the deck folder does not lead outside it', String(probe.symlink));
+check(probe.parentApi === 'blocked' && probe.parentDom === 'blocked', 'deck cannot reach the app window or its API', `${probe.parentApi}, ${probe.parentDom}`);
+
+/* -------------------------------------------- what a deck's own script can't do */
+
+// A deck script can post the same messages the app's controller posts. Outside edit
+// mode (and without the user starting an edit) the app must ignore them.
+const anyId = await mainFrame().evaluate(() => {
+  const el = window.__hp.slides[window.__hp.index].querySelector('h1, h2, p');
+  const id = el.getAttribute('data-hp-id');
+  parent.postMessage({ hp: 1, type: 'event', name: 'editBegin', data: { id, html: el.innerHTML } }, 'hpres://app');
+  parent.postMessage({ hp: 1, type: 'event', name: 'edit', data: { id, html: 'HACKED<script src="x.js"></script>', orig: el.innerHTML } }, 'hpres://app');
+  parent.postMessage({ hp: 1, type: 'event', name: 'requestDelete', data: null }, 'hpres://app');
+  return id;
+});
+await wait(800);
+const afterForge = await page.evaluate(() => window.hp.state());
+check(anyId && !afterForge.dirty && !afterForge.canUndo, 'messages forged by the deck change nothing', JSON.stringify({ dirty: afterForge.dirty }));
+
+// The deck's own iframes (embeds, local demos) load inside it; only the app's frames are guarded.
+await mainFrame().evaluate(() => { const f = document.createElement('iframe'); f.src = 'inner.html'; f.id = 'hp-test-inner'; document.body.appendChild(f); });
+let innerText = null;
+for (let i = 0; i < 30 && innerText === null; i++) {
+  const f = page.frames().find((x) => x.url().endsWith('/inner.html'));
+  if (f) innerText = await f.textContent('body').catch(() => null);
+  if (innerText === null) await wait(100);
+}
+check(innerText === 'inner ok', "an iframe inside the deck loads its page", String(innerText));
+await mainFrame().evaluate(() => document.getElementById('hp-test-inner').remove());
+
+/* ------------------------------------------------------------- edit & save */
+
 await page.click('#editBtn');
 await wait(300);
-const frame = page.frames().find((f) => f.url().includes('hp=main'));
-const target = await frame.evaluate(() => {
+const target = await mainFrame().evaluate(() => {
   const s = window.__hp.slides[window.__hp.index];
   const el = [...s.querySelectorAll('h1, h2, h3, p')].find((e) => e.textContent.trim().length > 3 && e.getBoundingClientRect().width > 0);
   if (!el) return null;
   const r = el.getBoundingClientRect();
-  return { x: r.left + Math.min(r.width - 4, 30), y: r.top + r.height / 2, text: el.textContent.trim().slice(0, 60), id: el.getAttribute('data-hp-id') };
+  return { x: r.left + Math.min(r.width - 4, 30), y: r.top + r.height / 2, id: el.getAttribute('data-hp-id') };
 });
-console.log('redigerar:', target);
+check(!!target, 'found a text to edit on slide 2');
 if (target) {
-  const fr = await page.$eval('#stage iframe', (f) => { const r = f.getBoundingClientRect(); return { left: r.left, top: r.top, scale: r.width / f.offsetWidth }; });
-  await page.mouse.click(fr.left + target.x * fr.scale, fr.top + target.y * fr.scale);
+  await clickInSlide(target.x, target.y);
   await wait(200);
-  const editing = await frame.evaluate(() => window.__hp.editing);
-  console.log('textredigering aktiv:', editing);
+  check(await mainFrame().evaluate(() => window.__hp.editing), 'clicking a text starts editing');
   await page.keyboard.press('End');
-  await page.keyboard.type(' [ÄNDRAT]');
-  await wait(150);
-  await shot(page, '3-editing');
+  await page.keyboard.type(' [EDITED]');
   await page.keyboard.press('Escape');
   await wait(400);
   await page.click('#saveBtn');
   await wait(600);
   const saved = fs.readFileSync(deck, 'utf8');
-  const changedChars = saved.length - original.length;
-  const idx = saved.indexOf('[ÄNDRAT]');
-  console.log('sparad fil innehåller ändringen:', idx >= 0, '| längdskillnad:', changedChars, '| märken kvar:', /data-hp-id/.test(saved));
-  // Allt utom den ändrade biten ska vara identiskt:
   let a = 0; while (a < original.length && original[a] === saved[a]) a++;
   let b = 0; while (b < original.length - a && original[original.length - 1 - b] === saved[saved.length - 1 - b]) b++;
-  console.log('ändrat område i originalet:', JSON.stringify(original.slice(a, original.length - b)), '→', JSON.stringify(saved.slice(a, saved.length - b)));
-  // Ta bort ett element (⌥-klick + ⌫) och ångra
-  const fr2 = await page.$eval('#stage iframe', (f) => { const r = f.getBoundingClientRect(); return { left: r.left, top: r.top, scale: r.width / f.offsetWidth }; });
-  await page.keyboard.down('Alt');
-  await page.mouse.click(fr2.left + target.x * fr2.scale, fr2.top + target.y * fr2.scale);
-  await page.keyboard.up('Alt');
+  const changed = saved.slice(a, saved.length - b);
+  check(saved.includes('[EDITED]') && !/data-hp-id/.test(saved), 'saved file has the edit and no internal markers');
+  check(changed === ' [EDITED]', 'nothing else in the file changed', JSON.stringify(changed).slice(0, 80));
+
+  await clickInSlide(target.x, target.y, ['Alt']);
   await wait(200);
-  const before = await frame.evaluate((id) => !!document.querySelector(`[data-hp-id="${id}"]`), target.id);
-  await shot(page, '3b-selected');
   await page.keyboard.press('Backspace');
   await wait(400);
-  const gone = await frame.evaluate((id) => !document.querySelector(`[data-hp-id="${id}"]`), target.id);
-  const dirty = await page.isVisible('#dirtyMark');
-  console.log('element fanns:', before, '| borttaget:', gone, '| markerad som ändrad:', dirty);
+  check(await mainFrame().evaluate((id) => !document.querySelector(`[data-hp-id="${id}"]`), target.id), '⌥-click + ⌫ deletes the element');
   await page.click('#undoBtn');
   await wait(1500);
-  const frameAfter = page.frames().find((f) => f.url().includes('hp=main'));
-  const back = await frameAfter.evaluate((id) => !!document.querySelector(`[data-hp-id="${id}"]`), target.id);
-  console.log('tillbaka efter ångra:', back, '| fortfarande ändrad:', await page.isVisible('#dirtyMark'));
+  check(await mainFrame().evaluate((id) => !!document.querySelector(`[data-hp-id="${id}"]`), target.id), 'undo brings it back');
 }
 await page.click('#editBtn');
 
-// Presentatörsläge (HP_FAKE_DUAL=1 ger publikfönstret som vanligt fönster)
-const audiencePromise = app.waitForEvent('window', { timeout: 15000 });
-await page.click('#presentBtn');
-const audience = await audiencePromise;
-await audience.waitForLoadState();
-audience.on('console', (m) => { if (m.type() === 'error') console.log('[audience]', m.text()); });
-audience.on('pageerror', (e) => console.log('[audience pageerror]', e.message));
-await page.waitForSelector('#presenter:not([hidden])');
-await audience.waitForFunction(() => { const f = document.querySelector('iframe'); return f && f.contentWindow && f.contentWindow.__hp && f.contentWindow.__hp.ready; }, null, { timeout: 20000 }).catch(() => console.log('publikfönstret blev aldrig klart'));
-await wait(1000);
-await page.keyboard.press('ArrowRight');
-await wait(1200);
-await shot(page, '4-presenter');
-await audience.screenshot({ path: path.join(out, '5-audience.png') });
-console.log('📸', path.join(out, '5-audience.png'));
-const audIdx = await audience.evaluate(() => { const f = document.querySelector('iframe'); return f && f.contentWindow.__hp ? f.contentWindow.__hp.index : null; });
-const presIdx = await page.evaluate(() => document.querySelector('#pCount').textContent);
-console.log('publik visar index', audIdx, '| presentatör:', presIdx);
+/* --------------------------------------------------------------- reorder */
 
+await page.click('#thumbList li:nth-child(1)');
+await wait(300);
+const before = await sidebarTitles();
+// Drag slide 1 below slide 3 in the sidebar.
+await page.dragAndDrop('#thumbList li:nth-child(1)', '#thumbList li:nth-child(3)', { targetPosition: { x: 60, y: 80 } });
+await waitReload(n0);
+const afterDrag = await sidebarTitles();
+check(afterDrag[2] === before[0] && afterDrag[0] === before[1], 'dragging a slide in the sidebar reorders it', afterDrag.slice(0, 3).join(' | '));
+check((await status()) === `Slide 3 av ${n0}`, 'the moved slide stays selected', await status());
+
+await menu('slide-up');
+await waitReload(n0);
+check((await sidebarTitles())[1] === before[0], '⌥⌘↑ (Slides menu) moves the slide up');
+
+await menu('slide-duplicate');
+await waitReload(n0 + 1);
+const dup = await sidebarTitles();
+check(dup.length === n0 + 1 && dup[1] === dup[2], 'duplicate adds a copy right after');
+await menu('slide-delete');
+await waitReload(n0);
+check((await slideCount()) === n0, 'delete slide removes it');
+
+for (const n of [n0 + 1, n0, n0, n0]) { await page.click('#undoBtn'); await waitReload(n); }
+check(JSON.stringify(await sidebarTitles()) === JSON.stringify(before), 'undo walks back through every reorder', (await sidebarTitles()).slice(0, 3).join(' | '));
+check(fs.readFileSync(deck, 'utf8').length === original.length + ' [EDITED]'.length, 'the file on disk only has the text edit');
+
+/* ------------------------------------------------- import from another deck */
+
+await app.evaluate(({ dialog }, p) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [p] }); }, other);
+await page.click('#thumbList li:nth-child(1)');
+await wait(300);
+await page.click('#importBtn');
+await page.waitForSelector('#importDlg:not([hidden])');
+await page.waitForFunction(() => document.querySelectorAll('#impGrid li[data-i]').length === 3, null, { timeout: 30000 });
+await page.waitForFunction(() => document.querySelectorAll('#impGrid .thumb img').length === 3, null, { timeout: 30000 }).catch(() => {});
+check(await page.isChecked('#impStyles'), 'a deck with a different design suggests keeping the original look');
+await page.click('#impGrid li[data-i="0"]');
+await shot(page, '3-import-dialog');
+await page.click('#impGo');
+await waitReload(n0 + 1);
+const imported = await sidebarTitles();
+check(imported[1] === 'Other one', 'imported slide lands after the current slide and is recognized as a slide', imported.slice(0, 3).join(' | '));
+check(fs.existsSync(path.join(deckDir, 'img', 'dot.png')), 'the image it uses is copied into the deck folder');
+await wait(800);
+const look = await mainFrame().evaluate(() => {
+  const s = window.__hp.slides[window.__hp.index];
+  const h1 = s.querySelector('h1');
+  const img = s.querySelector('img');
+  // Wrappern är @scope-roten; originalslidens element ligger direkt i den.
+  const wrap = s.querySelector('[class*="hp-imp-"]');
+  const inner = wrap && wrap.firstElementChild;
+  const r = inner && inner.getBoundingClientRect();
+  return { color: h1 && getComputedStyle(h1).color, bg: inner && getComputedStyle(inner).backgroundColor, size: r ? `${Math.round(r.width)}x${Math.round(r.height)}` : null, img: img && img.complete ? img.naturalWidth : null };
+});
+check(look.color === 'rgb(200, 30, 90)' && look.bg === 'rgb(250, 240, 220)' && look.size && !look.size.startsWith('0'), 'it keeps the original look (scoped CSS and CSS variables)', JSON.stringify(look));
+check(look.img === 1, 'its image loads from the copied file');
+const notesText = await page.textContent('#notesText');
+check(notesText.includes('note one'), 'its speaker note comes along', notesText.slice(0, 40));
+await shot(page, '4-imported');
+
+// Move: slide 3 of the other deck, adopting this deck's look. Saves at once and removes it from the other file.
+await page.click('#importBtn');
+await page.waitForFunction(() => document.querySelectorAll('#impGrid li[data-i]').length === 3, null, { timeout: 30000 });
+await page.click('#impGrid li[data-i="2"]');
+await page.check('#impMove');
+await page.uncheck('#impStyles');
+page.once('dialog', (d) => d.accept());
+await page.click('#impGo');
+await waitReload(n0 + 2);
+const otherNow = fs.readFileSync(other, 'utf8');
+check(!otherNow.includes('Third other') && otherNow.includes('Second other'), 'move removes the slide from the other file');
+check(JSON.parse(/speaker-notes">([\s\S]*?)<\/script>/.exec(otherNow)[1]).length === 2, "…and its note from that file's note list");
+const deckNow = fs.readFileSync(deck, 'utf8');
+check(deckNow.includes('Third other') && deckNow.includes('Imported title'), 'move saves both imported slides into this deck');
+check(!/data-hp-id/.test(deckNow), 'no internal markers in the saved deck');
+const backups = fs.readdirSync(path.join(out, 'userdata', 'Säkerhetskopior'));
+check(backups.some((f) => f.startsWith('other-deck.')), 'a backup of the other file is kept', backups.join(', '));
+check(await page.isDisabled('#undoBtn'), "a move can't be half-undone with ⌘Z (undo is off)");
+fs.writeFileSync(other, otherOriginal);
+
+// Moving every slide out of the other deck would leave it empty: refused before anything changes.
+const deckBeforeAll = fs.readFileSync(deck, 'utf8');
+await page.click('#importBtn');
+await page.waitForFunction(() => document.querySelectorAll('#impGrid li[data-i]').length === 3, null, { timeout: 30000 });
+await page.click('#impAll');
+await page.check('#impMove');
+page.once('dialog', (d) => d.accept());
+await page.click('#impGo');
+await page.waitForFunction(() => { const t = document.getElementById('toast'); return t && !t.hidden && t.classList.contains('error'); }, null, { timeout: 10000 }).catch(() => {});
+const allToast = await page.textContent('#toast');
+check(/minst en slide/.test(allToast) && fs.readFileSync(deck, 'utf8') === deckBeforeAll && fs.readFileSync(other, 'utf8') === otherOriginal && (await slideCount()) === n0 + 2,
+  'moving every slide out of a deck is refused and changes nothing', allToast.slice(0, 60));
+await page.keyboard.press('Escape');
+await wait(300);
+check(await page.isHidden('#importDlg'), 'Esc closes the import dialog');
+
+/* --------------------------------------------------------------- presenting */
+
+const audienceP = app.waitForEvent('window', { timeout: 15000 });
+await page.click('#thumbList li:nth-child(2)');
+await wait(300);
+await page.click('#presentBtn');
+const audience = await audienceP;
+await audience.waitForLoadState();
+audience.on('pageerror', (e) => check(false, 'no page errors in the audience window', e.message));
+await page.waitForSelector('#presenter:not([hidden])');
+let af = null;
+for (let i = 0; i < 100 && !af; i++) { af = audience.frames().find((x) => x.url().includes('hp=audience')); if (!af) await wait(100); }
+const audReady = af && await af.waitForFunction(() => window.__hp && window.__hp.ready, null, { timeout: 20000 }).then(() => true, () => false);
+check(!!audReady, 'audience window loads the deck');
+await wait(800);
+await page.keyboard.press('ArrowRight');
+await wait(1000);
+await shot(page, '5-presenter');
+await shot(audience, '6-audience');
+const audIdx = af ? await af.evaluate(() => window.__hp.index) : null;
+check(audIdx === 2, 'audience follows the presenter', `audience index ${audIdx}, presenter "${await page.textContent('#pCount')}"`);
 await page.keyboard.press('Escape');
 await wait(800);
-console.log('tillbaka i normalvy:', await page.isVisible('#workspace'));
+check(await page.isVisible('#workspace'), 'Esc ends the presentation');
+
+/* ------------------------------------------------- two slide commands in a row */
+
+// A second ⌘D before the views have reloaded must not act on the old slide list.
+const nBefore = await slideCount();
+await menu('slide-duplicate');
+await menu('slide-duplicate');
+await wait(2500);
+const nAfter = await slideCount();
+const idsUnique = await mainFrame().evaluate(() => { const ids = [...document.querySelectorAll('[data-hp-id]')].map((e) => e.getAttribute('data-hp-id')); return ids.length === new Set(ids).size; });
+check((nAfter === nBefore + 1 || nAfter === nBefore + 2) && idsUnique, 'a quick second ⌘D never corrupts the deck', `${nBefore} → ${nAfter}, unique ids: ${idsUnique}`);
+await menu('slide-up');
+await wait(2000);
+const t = await page.$eval('#toast', (el) => (el.hidden ? '' : el.className + ' ' + el.textContent));
+check(!/error/.test(t), 'slides can still be moved afterwards', t.slice(0, 80));
+await menu('save'); // otherwise closing the app asks whether to save
+await wait(800);
 
 await app.close();
-console.log('KLART');
+console.log(failures ? `\n${failures} check(s) failed` : '\nAll checks passed');

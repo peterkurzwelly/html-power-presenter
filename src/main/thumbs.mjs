@@ -3,14 +3,17 @@
 // Decket laddas med ?hp=thumb, vilket gör att kontrollern stänger av animationer
 // och ljud. Sedan visas en slide i taget och fönstret fotograferas.
 
+import { cleanInfo } from '../renderer/deckinfo.mjs';
 import { BrowserWindow } from 'electron';
 
 const THUMB_WIDTH = 640;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class ThumbRenderer {
-  constructor(onThumb) {
+  constructor(onThumb, onInfo = null) {
     this.onThumb = onThumb;
+    this.onInfo = onInfo;
+    this.loadedUrl = null;
     this.win = null;
     this.job = 0;
     this.chain = Promise.resolve();
@@ -29,6 +32,9 @@ export class ThumbRenderer {
         spellcheck: false,
       },
     });
+    // Decket körs här som toppsida: inga nya fönster och ingen navigering bort.
+    this.win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    this.win.webContents.on('will-navigate', (e) => e.preventDefault());
     this.win.webContents.setAudioMuted(true);
     this.win.webContents.setFrameRate(30);
     return this.win;
@@ -53,7 +59,10 @@ export class ThumbRenderer {
     const ready = await this._waitReady(wc, job);
     if (!ready || job !== this.job) return;
 
-    const info = await wc.executeJavaScript('window.__hp.info()');
+    let info;
+    try { info = cleanInfo(await wc.executeJavaScript('window.__hp.info()')); } catch (err) { console.error('[thumbs]', err.message); return; }
+    this.loadedUrl = url;
+    if (this.onInfo) this.onInfo({ token, info });
     const { w, h } = info.size;
     win.setContentSize(w, h);
     await wait(80);
@@ -84,6 +93,13 @@ export class ThumbRenderer {
       await wait(60);
     }
     return false;
+  }
+
+  // Kör kod i decket som är laddat i fönstret (t.ex. för att läsa dess CSS).
+  async exec(js) {
+    await this.chain;
+    if (!this.win || this.win.isDestroyed() || !this.loadedUrl) throw new Error('Förhandsvisningen är inte laddad.');
+    return this.win.webContents.executeJavaScript(js);
   }
 
   destroy() {

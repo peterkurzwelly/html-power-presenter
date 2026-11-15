@@ -52,6 +52,23 @@ await shot(page, 'edit-mode.png');
 await page.keyboard.press('Escape');
 await page.click('#editBtn');
 
+// Import dialog: slides from another talk (a copy of the demo deck in another folder)
+const otherDir = path.join(work, 'last-years-talk');
+fs.mkdirSync(otherDir);
+const other = path.join(otherDir, 'last-years-talk.html');
+fs.copyFileSync(path.join(root, 'examples', 'demo-deck.html'), other);
+await app.evaluate(({ dialog }, p) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [p] }); }, other);
+await page.click('#thumbList li:nth-child(2)');
+await wait(300);
+await page.click('#importBtn');
+await page.waitForFunction(() => document.querySelectorAll('#impGrid .thumb img').length >= 6, null, { timeout: 60000 });
+await page.click('#impGrid li[data-i="2"]');
+await page.click('#impGrid li[data-i="3"]', { modifiers: ['Shift'] });
+await wait(300);
+await shot(page, 'import-dialog.png');
+await page.click('#impCancel');
+await wait(300);
+
 // Presenter view on slide 3
 const audienceP = app.waitForEvent('window', { timeout: 15000 });
 await page.click('#thumbList li:nth-child(3)');

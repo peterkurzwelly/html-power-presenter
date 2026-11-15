@@ -13,6 +13,9 @@
   if (window.__hp) return;
 
   const params = new URLSearchParams(location.search);
+  // Adressen decket laddades med. Decket kan ändra sin adress (history.replaceState)
+  // innan vi är klara, men appen känner igen laddningen på den här.
+  const BOOT_HREF = location.href;
   const MODE = params.get('hp') || 'main';
   const MUTED = MODE !== 'audience';
   const STILL = MODE === 'thumb' || MODE === 'next';
@@ -47,17 +50,65 @@
     edit: false,
     editing: false,
     scale: 1,
-    // Sätts av appen:
-    onKey: null, onEdit: null, onSelect: null, onRequestDelete: null,
   };
+
+  /* ------------------------------------------------------------ meddelanden */
+
+  // Decket har en egen origin. Appen (hpres://app) är vår förälder och vi pratar
+  // bara via postMessage. Kommandon tas bara emot från föräldern på appens origin.
+  const APP_ORIGIN = 'hpres://app';
+  const host = window.parent !== window ? window.parent : null;
+  const emit = (name, data) => { if (host) host.postMessage({ hp: 1, type: 'event', name, data }, APP_ORIGIN); };
+
+  const CALLS = {
+    show: (i) => hp.show(i),
+    setScale: (s) => hp.setScale(s),
+    setEdit: (on) => hp.setEdit(on),
+    commit: () => hp.commit(),
+    deselect: () => hp.deselect(),
+    selectParent: () => hp.selectParent(),
+    editSelected: () => hp.editSelected(),
+    removeById: (id) => hp.removeById(id),
+    execUndo: (redo) => hp.execUndo(redo),
+    cancelEdit: (id) => hp.cancelEdit(id),
+    info: () => hp.info(),
+  };
+
+  window.addEventListener('message', (e) => {
+    if (!host || e.source !== host || e.origin !== APP_ORIGIN) return;
+    const m = e.data;
+    if (!m || m.hp !== 1 || m.type !== 'call' || !Object.prototype.hasOwnProperty.call(CALLS, m.method)) return;
+    e.stopImmediatePropagation();
+    let result, error;
+    try { result = CALLS[m.method].apply(null, Array.isArray(m.args) ? m.args : []); }
+    catch (err) { error = String(err && err.message || err); }
+    const reply = (r) => host.postMessage({ hp: 1, type: 'reply', id: m.id, result: r === undefined ? null : r, error }, APP_ORIGIN);
+    if (result && typeof result.then === 'function') result.then(reply, (err) => { error = String(err); reply(null); });
+    else reply(result);
+  }, true);
 
   /* --------------------------------------------------------------- tangenter */
 
   const pick = (e) => ({ key: e.key, code: e.code, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey, repeat: e.repeat });
   const NAV_KEYS = new Set(['ArrowRight', 'ArrowLeft', 'ArrowUp', 'ArrowDown', ' ', 'PageUp', 'PageDown', 'Home', 'End', 'Backspace', 'Enter', 'Tab']);
 
+  // Fält där man skriver text. Kryssrutor, radioknappar och reglage räknas inte: där ska
+  // piltangenter och en presentationsklicker fortfarande byta slide.
+  const ownField = (t) => t && t.nodeType === 1 && !t.closest('[data-hp-ui]')
+    && (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable
+      || (t.tagName === 'INPUT' && !/^(checkbox|radio|range|button|submit|reset|color|file|image)$/i.test(t.type)));
+
   ['keydown', 'keyup', 'keypress'].forEach((type) => {
     window.addEventListener(type, (e) => {
+      // Skriver du i ett fält som decket själv har (ett formulär, en kodruta) får decket
+      // tangenterna som vanligt. Esc tar dig ändå ut ur fältet.
+      if (!hp.editing && ownField(e.target)) {
+        if (e.key !== 'Escape') return;
+        // Esc lämnar fältet (men avslutar inte presentationen).
+        e.preventDefault(); e.stopImmediatePropagation();
+        if (type === 'keydown') e.target.blur();
+        return;
+      }
       if (hp.editing) {
         if (type === 'keydown' && editKey(e)) { e.preventDefault(); }
         e.stopImmediatePropagation(); // decket får inte se tangenterna, men texten skrivs ändå
@@ -67,7 +118,7 @@
       if (type !== 'keydown') return;
       if (hp.edit && selectionKey(e)) { e.preventDefault(); return; }
       if (NAV_KEYS.has(e.key) && !e.metaKey && !e.ctrlKey) e.preventDefault();
-      if (hp.onKey) hp.onKey(pick(e));
+      emit('key', pick(e));
     }, true);
   });
 
@@ -102,6 +153,13 @@
   /* -------------------------------------------------------------- uppdelning */
 
   function detect() {
+    // Appen skickar regeln som hittade slidesen förra gången (samma fil). Har decket bara
+    // en slide kvar, t.ex. efter att du tagit bort de andra, gäller den regeln ändå.
+    const prev = params.get('hpsel');
+    if (prev && (SELECTORS.includes(prev) || /^[a-z][\w-]*\.[\w-]+$/.test(prev))) {
+      const one = Array.from(document.querySelectorAll(prev)).filter((el) => !el.closest('template'));
+      if (one.length === 1) return { els: one, strategy: prev };
+    }
     for (const sel of SELECTORS) {
       let els = Array.from(document.querySelectorAll(sel)).filter((el) => !el.closest('template'));
       if (els.length < 2) continue;
@@ -131,7 +189,32 @@
       }
       return { els, strategy: sel };
     }
-    return { els: [document.body], strategy: 'hela sidan', whole: true };
+    return detectGeneric() || { els: [document.body], strategy: 'hela sidan', whole: true };
+  }
+
+  // Sista utväg: syskon med samma tagg och klass som antingen är stora eller visas
+  // en i taget (resten dolda), t.ex. <div class="page"> eller <article class="frame">.
+  function detectGeneric() {
+    let best = null;
+    for (const parent of document.querySelectorAll('body, body *')) {
+      if (SKIP_TAGS.has(parent.tagName) || parent.closest('template, svg')) continue;
+      const groups = new Map();
+      for (const k of parent.children) {
+        const cls = k.classList[0];
+        if (!cls || SKIP_TAGS.has(k.tagName)) continue;
+        const key = k.tagName.toLowerCase() + '.' + cls;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(k);
+      }
+      groups.forEach((g, key) => {
+        if (g.length < 2 || (best && g.length <= best.els.length)) return;
+        const hidden = g.filter(isHidden);
+        const big = g.filter((el) => { const r = el.getBoundingClientRect(); return r.width >= 300 && r.height >= 200; });
+        const oneAtATime = hidden.length >= g.length - 1 && hidden.length > 0;
+        if (oneAtATime || big.length === g.length) best = { els: g, strategy: key };
+      });
+    }
+    return best;
   }
 
   function isHidden(el) {
@@ -143,6 +226,7 @@
   // efter att klassen lagts till. Stäng av dem medan vi mäter.
   function withoutMotion(fn) {
     const s = document.createElement('style');
+    s.setAttribute('data-hp-ui-style', '');
     s.textContent = '*,*::before,*::after{transition:none!important;animation:none!important}';
     (document.head || document.documentElement).appendChild(s);
     try { return fn(); } finally { s.remove(); }
@@ -393,7 +477,172 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
       title: document.title,
       titles: hp.slides.map(titleOf),
       notes: hp.whole ? [''] : hp.slides.map((s, i) => notesOf(s, i, fromJson)),
+      // För att flytta slides i källfilen:
+      ids: hp.whole ? [] : hp.slides.map((s) => s.getAttribute('data-hp-id')),
+      siblings: !hp.whole && hp.slides.every((s) => s.parentElement === hp.slides[0].parentElement),
+      slideTag: hp.whole ? '' : mostCommon(hp.slides.map((s) => s.tagName.toLowerCase())),
+      commonClasses: hp.whole ? [] : commonClasses(hp.slides),
+      jsonNotes: !!fromJson,
     };
+  };
+
+  function mostCommon(list) {
+    const n = new Map();
+    list.forEach((x) => n.set(x, (n.get(x) || 0) + 1));
+    let best = '', c = 0;
+    n.forEach((v, k) => { if (v > c) { best = k; c = v; } });
+    return best;
+  }
+
+  function commonClasses(slides) {
+    if (!slides.length) return [];
+    let common = Array.from(slides[0].classList);
+    slides.forEach((s) => { common = common.filter((c) => s.classList.contains(c)); });
+    return common.filter((c) => !hp.activeClasses.includes(c) && !/^hp-/.test(c));
+  }
+
+  /* ------------------------------------------- stilar för import till annat deck */
+
+  // När en slide kopieras till ett deck med annan design tar vi med de CSS-regler
+  // från det här decket som faktiskt träffar sliden. Körs i miniatyrfönstret för
+  // källdecket, där webbläsaren redan har tolkat all CSS.
+  const INHERITED = /^(--|color$|font|line-height$|letter-spacing$|word-spacing$|text-(align|indent|transform|shadow|rendering|wrap)|white-space$|direction$|hyphens$|quotes$|list-style|cursor$|tab-size$|-webkit-font-smoothing$|font-feature|font-variant)/;
+  const DYNAMIC = /::?(before|after|marker|placeholder|selection|first-line|first-letter|backdrop|file-selector-button)\b|:(hover|focus|focus-visible|focus-within|active|visited|target|checked|disabled|enabled)\b/g;
+
+  function splitSelectors(text) {
+    const out = []; let depth = 0, cur = '';
+    for (const ch of text) {
+      if (ch === '(' || ch === '[') depth++;
+      if (ch === ')' || ch === ']') depth--;
+      if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; } else cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+
+  function testable(sel) { return sel.replace(DYNAMIC, '').replace(/\(\s*\)/g, '').trim() || '*'; }
+
+  function ancestorsOf(el) { const a = []; for (let p = el.parentElement; p; p = p.parentElement) a.push(p); return a; }
+
+  hp.collectStyles = function (ids) {
+    const rules = [];
+    const links = [];
+    for (const sheet of Array.from(document.styleSheets)) {
+      const node = sheet.ownerNode;
+      if (!node || (node.hasAttribute && node.hasAttribute('data-hp-ui-style'))) continue;
+      let list;
+      try { list = sheet.cssRules; } catch (_) { if (sheet.href) links.push(sheet.href); continue; }
+      for (const r of Array.from(list)) rules.push(r);
+    }
+    document.querySelectorAll('link[rel~="stylesheet"][href]').forEach((l) => { if (!links.includes(l.href) && !/^hpres:/.test(l.href)) links.push(l.href); });
+
+    return ids.map((id) => {
+      const slide = document.querySelector(`[data-hp-id="${id}"]`);
+      if (!slide) return null;
+      // Visa sliden först, så att regler som .slide.on … träffar den.
+      const idx = hp.slides.indexOf(slide);
+      if (idx >= 0) hp.show(idx);
+      const ancestors = ancestorsOf(slide);
+      const scoped = [];
+      const inherit = [];
+      const hoisted = [];
+
+      // 'inside' = träffar något inuti sliden, 'root' = bara själva slide-elementet,
+      // 'ancestor' = bara element ovanför sliden (då ärvs bara t.ex. typsnitt och färg).
+      const classify = (selText) => {
+        let inside = false, root = false, ancestor = false;
+        for (const sel of splitSelectors(selText)) {
+          const t = testable(sel);
+          try {
+            if (slide.querySelector(t)) inside = true;
+            else if (slide.matches(t)) root = true;
+            else if (ancestors.some((a) => a.matches(t))) ancestor = true;
+          } catch (_) { inside = true; } // okänd syntax: ta hellre med
+        }
+        return inside ? 'inside' : root ? 'root' : ancestor ? 'ancestor' : null;
+      };
+      // På själva slide-elementet styr det mottagande decket placering och synlighet.
+      const ROOT_SKIP = /^(position|inset|top|right|bottom|left|width|height|min-|max-|margin|transform|translate|scale|rotate|opacity|visibility|z-index|transition|zoom|content-visibility|will-change|contain|float|clear)/;
+      const declsOf = (style, keep) => {
+        const out = [];
+        for (let i = 0; i < style.length; i++) {
+          const prop = style[i];
+          if (keep(prop)) out.push(`${prop}: ${style.getPropertyValue(prop)}${style.getPropertyPriority(prop) ? ' !important' : ''}`);
+        }
+        return out;
+      };
+      // I det mottagande decket ligger sliden i en ram (scope-roten). Delar av en
+      // selektor som träffar element ovanför sliden här (t.ex. .stage i
+      // ".stage .slide h2", eller html/body) byts mot :scope.
+      const COMB = new Set([' ', '>', '+', '~']);
+      const tokens = (sel) => {
+        const toks = []; let cur = '', depth = 0;
+        for (const ch of sel.trim()) {
+          if (ch === '(' || ch === '[') depth++;
+          if (ch === ')' || ch === ']') depth--;
+          if (depth === 0 && /[\s>+~]/.test(ch)) {
+            if (cur) { toks.push(cur); cur = ''; }
+            const last = toks[toks.length - 1];
+            if (/\s/.test(ch)) { if (last && !COMB.has(last)) toks.push(' '); }
+            else if (last === ' ') toks[toks.length - 1] = ch; else toks.push(ch);
+            continue;
+          }
+          cur += ch;
+        }
+        if (cur) toks.push(cur);
+        while (toks.length && COMB.has(toks[toks.length - 1])) toks.pop();
+        return toks;
+      };
+      const scopeOne = (sel) => {
+        sel = sel.replace(/(^|[\s>+~(,])(:root|html|body)(?![\w-])/g, '$1:scope');
+        const toks = tokens(sel);
+        let cut = -1;
+        for (let i = 0; i < toks.length - 2; i += 2) {
+          const prefix = toks.slice(0, i + 1).join('');
+          if (prefix === ':scope') { cut = i; continue; }
+          try { if (ancestors.some((a) => a.matches(testable(prefix)))) cut = i; } catch (_) { /* ogiltig del */ }
+        }
+        return cut < 0 ? sel : ':scope' + toks.slice(cut + 1).join('');
+      };
+      const rewrite = (sel) => splitSelectors(sel).map(scopeOne).join(', ');
+
+      const walk = (list, out, inheritOut) => {
+        for (const r of Array.from(list)) {
+          if (r instanceof CSSStyleRule) {
+            const kind = classify(r.selectorText);
+            if (kind === 'inside') {
+              const brace = r.cssText.indexOf('{');
+              out.push(rewrite(r.selectorText) + ' ' + r.cssText.slice(brace));
+            } else if (kind === 'root') {
+              const decls = declsOf(r.style, (prop) => !ROOT_SKIP.test(prop));
+              if (decls.length) out.push(rewrite(r.selectorText) + ' { ' + decls.join('; ') + ' }');
+            } else if (kind === 'ancestor') {
+              const decls = declsOf(r.style, (prop) => INHERITED.test(prop));
+              if (decls.length) inheritOut.push(decls.join('; '));
+            }
+          } else if (r.cssRules && (r instanceof CSSMediaRule || r instanceof CSSSupportsRule || (window.CSSContainerRule && r instanceof CSSContainerRule) || (window.CSSLayerBlockRule && r instanceof CSSLayerBlockRule))) {
+            const inner = [], innerInherit = [];
+            walk(r.cssRules, inner, innerInherit);
+            const prelude = r.cssText.slice(0, r.cssText.indexOf('{')).trim();
+            if (innerInherit.length) inner.unshift(':scope { ' + innerInherit.join('; ') + ' }');
+            if (inner.length) out.push(prelude + ' {\n' + inner.join('\n') + '\n}');
+          } else if (r instanceof CSSFontFaceRule || r instanceof CSSKeyframesRule || (window.CSSPropertyRule && r instanceof CSSPropertyRule)) {
+            hoisted.push(r);
+          }
+        }
+      };
+      walk(rules, scoped, inherit);
+
+      // Ta bara med typsnitt och animationer som de medtagna reglerna använder.
+      const used = scoped.join('\n') + inherit.join(';');
+      const keep = hoisted.filter((r) => {
+        if (r instanceof CSSFontFaceRule) { const fam = (r.style.getPropertyValue('font-family') || '').replace(/["']/g, '').trim(); return fam && used.includes(fam); }
+        if (r instanceof CSSKeyframesRule) return used.includes(r.name);
+        return true;
+      }).map((r) => r.cssText);
+
+      return { id, hoisted: keep, inherit: inherit.join('; '), scoped, links };
+    });
   };
 
   hp.setScale = function (s) { hp.scale = s || 1; drawBoxes(); };
@@ -475,10 +724,9 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
   }
 
   function report() {
-    if (!hp.onSelect) return;
-    if (!selected || !selected.isConnected) { hp.onSelect(null); return; }
+    if (!selected || !selected.isConnected) { emit('select', null); return; }
     const r = selected.getBoundingClientRect();
-    hp.onSelect({
+    emit('select', {
       kind: selKind,
       id: selected.getAttribute('data-hp-id'),
       label: describe(selected),
@@ -524,6 +772,9 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
     block.setAttribute('contenteditable', 'plaintext-only');
     block.setAttribute('spellcheck', 'false');
     hp.editing = true;
+    emit('editing', true);
+    // Appen kontrollerar att texten ser ut som i källfilen (inte ändrad av skript).
+    emit('editBegin', { id: block.getAttribute('data-hp-id'), html: block.__hpOrig });
     block.focus({ preventScroll: true });
     if (x != null) placeCaret(block, x, y);
     else {
@@ -554,14 +805,15 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
     if (!el) return;
     editingEl = null;
     hp.editing = false;
+    emit('editing', false);
     el.removeAttribute('contenteditable');
     if (el.__hpHadSpell == null) el.removeAttribute('spellcheck'); else el.setAttribute('spellcheck', el.__hpHadSpell);
     let html = clean(el);
     // plaintext-only lämnar ibland ett <br> på slutet när man raderat allt.
     if (/<br>$/.test(html) && !/<br\s*\/?>$/.test(el.__hpOrig || '')) html = html.replace(/<br>$/, '');
     try { getSelection().removeAllRanges(); } catch (_) {}
-    if (html !== el.__hpOrig && hp.onEdit) {
-      hp.onEdit({ id: el.getAttribute('data-hp-id'), html, slide: hp.index });
+    if (html !== el.__hpOrig) {
+      emit('edit', { id: el.getAttribute('data-hp-id'), html, orig: el.__hpOrig, slide: hp.index });
     }
     el.__hpOrig = undefined;
   }
@@ -580,7 +832,7 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
 
   function selectionKey(e) {
     if (!selected) return false;
-    if (e.key === 'Backspace' || e.key === 'Delete') { if (hp.onRequestDelete) hp.onRequestDelete(); return true; }
+    if (e.key === 'Backspace' || e.key === 'Delete') { if (selKind !== 'text') emit('requestDelete'); return true; }
     if (e.key === 'Escape') { clearSelection(); return true; }
     if (e.key === 'Enter') { const b = textBlockFor(selected); if (b === selected) beginEdit(b); return true; }
     if (e.key === 'ArrowUp' && e.altKey) { hp.selectParent(); return true; }
@@ -595,6 +847,21 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
   };
 
   hp.commit = function () { commitEditing(); };
+
+  // Avbryt redigeringen och återställ texten (när den inte går att spara säkert).
+  hp.cancelEdit = function (id) {
+    const el = editingEl;
+    if (!el || el.getAttribute('data-hp-id') !== String(id)) return;
+    editingEl = null;
+    hp.editing = false;
+    emit('editing', false);
+    el.removeAttribute('contenteditable');
+    if (el.__hpHadSpell == null) el.removeAttribute('spellcheck'); else el.setAttribute('spellcheck', el.__hpHadSpell);
+    if (clean(el) !== el.__hpOrig) el.innerHTML = el.__hpOrig;
+    el.__hpOrig = undefined;
+    try { getSelection().removeAllRanges(); } catch (_) {}
+    select(el, 'element');
+  };
   hp.deselect = function () { commitEditing(); clearSelection(); };
   hp.editSelected = function () { if (selected) { const b = textBlockFor(selected); if (b) beginEdit(b); } };
   hp.selectedId = function () { return selected ? selected.getAttribute('data-hp-id') : null; };
@@ -668,6 +935,14 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
   });
 
   window.addEventListener('resize', drawBoxes);
+  // Klick utanför sliden (verktygsrad, meny, annat fönster): spara textändringen.
+  // Byter du program mitt i en text sparas den, och markeringen tas bort så att ⌫
+  // när du kommer tillbaka inte tar bort hela elementet.
+  window.addEventListener('blur', () => {
+    const was = editingEl;
+    commitEditing();
+    if (was && selected === was) clearSelection();
+  });
   // Ramen och verktygsraden följer med när texten växer eller krymper.
   document.addEventListener('input', () => { if (editingEl) { drawBoxes(); report(); } }, true);
 
@@ -701,6 +976,7 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
       hp.index = 0;
     }
     hp.ready = true;
+    emit('ready', { href: BOOT_HREF, info: Object.assign(hp.info(), { index: hp.index }) });
   }
 
   // Publikfönstret: dölj muspekaren när den står still.
@@ -713,6 +989,7 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
     };
     document.addEventListener('mousemove', wake, true);
     const s = document.createElement('style');
+    s.setAttribute('data-hp-ui-style', '');
     s.textContent = 'html.hp-idle, html.hp-idle * { cursor: none !important; }';
     (document.head || document.documentElement).appendChild(s);
     wake();

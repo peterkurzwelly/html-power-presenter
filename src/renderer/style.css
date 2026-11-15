@@ -81,6 +81,7 @@ kbd { font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace; padding: 2px 5px; 
 .doc { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .doc-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dirty { font-size: 11px; color: #fcd34d; background: rgba(245,158,11,.14); border: 1px solid rgba(245,158,11,.4); padding: 1px 7px; border-radius: 99px; white-space: nowrap; }
+.dirty.readonly { color: #fca5a5; background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.4); }
 .seg { -webkit-app-region: no-drag; display: flex; background: var(--bg); border: 1px solid var(--line-2); border-radius: 7px; padding: 2px; }
 .seg button { border: 0; background: none; padding: 4px 12px; border-radius: 5px; cursor: pointer; color: var(--text-2); }
 .seg button.active { background: var(--bg-3); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.4); }
@@ -182,3 +183,36 @@ li.sel .thumb { border-color: var(--warn); }
 .p-grid-overlay { position: absolute; inset: 56px 0 0 0; background: rgba(8,9,11,.97); z-index: 20; display: flex; flex-direction: column; }
 .p-grid-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 20px; color: var(--text-2); }
 .p-banner { position: absolute; left: 50%; top: 66px; transform: translateX(-50%); background: #1d2433; border: 1px solid #34436a; color: #c7d4f5; padding: 8px 14px; border-radius: 8px; z-index: 30; font-size: 12px; }
+
+/* ------------------------------------------------- flytta slides */
+.sidebar { display: flex; flex-direction: column; padding-bottom: 0; }
+.thumb-list { flex: 1; overflow-y: auto; padding-bottom: 20px; }
+.sidebar { overflow: hidden; }
+.sidebar-foot { flex: none; padding: 10px 4px 12px 28px; border-top: 1px solid var(--line); }
+.sidebar-foot .btn { width: 100%; white-space: normal; text-align: left; line-height: 1.3; }
+li[draggable="true"] { -webkit-user-drag: element; }
+li.dragging { opacity: .35; }
+.thumb-list li.drop-before .thumb { box-shadow: 0 -5px 0 -1px var(--accent); }
+.thumb-list li.drop-after .thumb { box-shadow: 0 5px 0 -1px var(--accent); }
+.grid-list li.drop-before .thumb { box-shadow: -7px 0 0 -2px var(--accent); }
+.grid-list li.drop-after .thumb { box-shadow: 7px 0 0 -2px var(--accent); }
+
+/* ------------------------------------------------- import-dialog */
+.modal { position: fixed; inset: 0; z-index: 80; background: rgba(5,6,8,.72); display: grid; place-items: center; padding: 40px; }
+.modal-box { width: min(1180px, 100%); height: min(860px, 100%); background: var(--bg-2); border: 1px solid var(--line-2); border-radius: 14px; display: flex; flex-direction: column; box-shadow: 0 30px 80px rgba(0,0,0,.6); overflow: hidden; }
+.modal-head { display: flex; align-items: center; gap: 12px; padding: 16px 18px 6px 22px; }
+.modal-head h2 { flex: 1; margin: 0; font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.modal-hint { margin: 0; padding: 0 22px 8px; font-size: 12px; }
+.imp-grid { --tw: 210px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--bg); }
+.imp-grid li { position: relative; }
+.imp-grid li.sel .thumb { border-color: var(--accent); outline-color: var(--accent); }
+.imp-grid .check { position: absolute; right: 6px; top: 6px; width: 22px; height: 22px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 13px; display: none; place-items: center; z-index: 2; }
+.imp-grid li.sel .check { display: grid; }
+.imp-wait { grid-column: 1 / -1; color: var(--text-2); padding: 30px; text-align: center; }
+.modal-foot { display: flex; gap: 20px; align-items: flex-end; padding: 14px 18px 16px 22px; }
+.imp-opts { flex: 1; display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; }
+.imp-opts select { margin-left: 6px; background: var(--bg-3); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 3px 6px; font: inherit; }
+.imp-opts .chk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.imp-opts p { flex-basis: 100%; margin: 0; }
+.small { font-size: 12px; }
+.imp-actions { display: flex; gap: 8px; }

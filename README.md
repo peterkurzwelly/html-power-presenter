@@ -10,16 +10,18 @@ If you build slide decks as single HTML files (by hand, with reveal.js, or gener
 
 - **Presenter view on two screens.** The audience sees only the slide, full screen on the projector. You see the current and next slide, your notes, a timer and the clock.
 - **Grid of every slide**, with real thumbnails.
-- **Edit mode** for last-minute fixes. Click a text, change it, save. Only the bytes you changed are written; the rest of the file stays byte for byte identical.
+- **Reorder, duplicate and delete slides** by dragging thumbnails or from the Slides menu.
+- **Bring slides over from another deck**, as a copy or a move, keeping their original look if the two decks are designed differently.
+- **Edit mode** for last-minute fixes. Click a text, change it, save. Only the element you edited is rewritten; the rest of the file stays byte for byte identical.
 - **Your deck keeps running.** The deck's own scripts, animations, charts and code demos work as in a browser. The app only decides which slide is shown.
 
-> The app's interface is in Swedish for now (*Redigera* = Edit, *Rutnät* = Grid, *Presentera* = Present).
+> The app's interface is in Swedish for now (*Redigera* = Edit, *Rutnät* = Grid, *Presentera* = Present, *Infoga* = Insert).
 
 | Normal view | Grid |
 |---|---|
 | ![Normal view with slide thumbnails, the current slide and speaker notes](docs/normal-view.png) | ![Grid of every slide](docs/grid-view.png) |
-| **Edit mode** | **Audience window** |
-| ![Editing a heading directly on the slide](docs/edit-mode.png) | ![The audience window shows only the slide](docs/audience-window.png) |
+| **Edit mode** | **Insert slides from another deck** |
+| ![Editing a heading directly on the slide](docs/edit-mode.png) | ![Picking two slides from another deck to insert](docs/import-dialog.png) |
 
 ## Install
 
@@ -55,6 +57,7 @@ Open [`examples/demo-deck.html`](examples/demo-deck.html): ⌘O, drag the file o
 | Edit mode | ⌘E |
 | Save / Save as | ⌘S / ⇧⌘S |
 | Undo / Redo | ⌘Z / ⇧⌘Z |
+| Reload the file from disk | ⌘R |
 | Present from the current slide | ⌘↩ |
 | Present from the start | ⇧⌘↩ |
 | Rehearse (presenter view, no audience window) | ⌥⌘↩ |
@@ -73,7 +76,33 @@ Open [`examples/demo-deck.html`](examples/demo-deck.html): ⌘O, drag the file o
 | T | restart the timer |
 | Esc | stop presenting |
 
-Presentation clickers send these keys, so they work too. With two screens, the audience window goes full screen on the screen the app window is *not* on. **Byt skärmar** swaps them. With one screen, the audience window covers it. Plug in a projector mid-talk and the audience window moves there.
+Presentation clickers send these keys, so they work too. With two screens, the audience window goes full screen on the screen the app window is *not* on. **Byt skärmar** (Swap screens, in the Bildspel menu) swaps them. With one screen, the audience window covers it. Plug in a projector mid-talk and the audience window moves there.
+
+### Rearranging slides
+
+Drag a thumbnail in the sidebar or the grid to move the slide. Or use the **Slides** menu:
+
+| | Shortcut |
+|---|---|
+| Move slide up / down | ⌥⌘↑ / ⌥⌘↓ |
+| Move slide to the start / end | ⇧⌥⌘↑ / ⇧⌥⌘↓ |
+| Duplicate slide | ⌘D |
+| Delete slide | ⌫ in the grid or sidebar, or **Ta bort slide** in the menu |
+
+A slide moves together with the HTML comment just above it (often its title, like `<!-- 3 Pricing -->`). Anything else between slides, such as a `<script>` that draws a chart, stays where it is and is never deleted or copied. Notes kept in a `<script id="speaker-notes">` list are reordered to match. Every change can be undone with ⌘Z and nothing is written to disk until you save.
+
+This works when all slides sit side by side in the same parent element, which is how nearly every deck is built.
+
+### Inserting slides from another deck
+
+Choose **Slides → Infoga slides från annan presentation…** (⇧⌘I) or the button under the thumbnails, and pick another `.html` file. You get a grid of its slides:
+
+- **Click** the slides you want. Shift-click selects a range.
+- **Placera** (Place): after the current slide, first, or last.
+- **Behåll originalets utseende** (Keep the original look): the slide is wrapped with the CSS rules it needs from the other deck, scoped with `@scope` so they can't leak into the rest of your deck. Fonts and animations it uses come along (renamed if your deck already uses the same names), and it's scaled to fit if the slide sizes differ. A `<style>` inside an inserted slide is limited to that slide either way. The app ticks this for you when the two decks look differently designed. Leave it off when both decks share a design; the slide then takes on this deck's look.
+- **Flytta** (Move): also removes the slides from the other file. This saves both files, and it can't be undone with ⌘Z. The backup folder keeps a copy of the other file as it was, and of this one as it was when you opened it. If the move can't be completed (say it would leave the other deck empty), nothing is changed.
+
+Images, videos, fonts and stylesheets the slides refer to with relative paths are copied into this deck's folder: to the same relative path if that's free, otherwise into `assets-from-<other deck>/`. Only files inside the other deck's own folder are copied, the same rule the app uses when it shows a deck. Speaker notes come along.
 
 ### Editing
 
@@ -84,15 +113,21 @@ Press ⌘E. Then:
 - **⌫** deletes the selected element.
 - **⌘Z** undoes, **⌘S** saves.
 
+Some texts can't be edited, and the app says so instead of guessing:
+
+- Text that the deck's own scripts change after loading, such as formulas rendered by KaTeX, highlighted code or animated counters. Saving it would write the script's output into your file.
+- Elements the browser had to repair because tags in the source cross each other (like `<b>` spanning two paragraphs).
+- Files that aren't saved as UTF-8. These open read-only, marked **Skrivskyddad**. Save the file as UTF-8 in your editor to edit it here.
+
 The first save after opening a file puts a copy of the original in `~/Library/Application Support/HTML Presenter/Säkerhetskopior/`.
 
-If the file changes on disk while it's open (say you regenerate it with an AI tool), the app reloads it. If you have unsaved edits, it asks first.
+If the file changes on disk while it's open (say you regenerate it with an AI tool), the app reloads it. If you have unsaved edits, it asks first. Closing the window, quitting or opening another file also asks, and counts a text you're in the middle of typing as an unsaved edit.
 
 ## What decks work
 
 Any HTML file where each slide is its own element. The app looks for slides in this order and uses the first rule that finds two or more:
 
-`deck-stage > section` · `.reveal .slides > section` · `.slides > section` · `section.slide` · `div.slide` · `.slide` · `[data-slide]` · `body > section` · `main > section` · `.step` · `body > article` · finally the element with the most `<section>` children.
+`deck-stage > section` · `.reveal .slides > section` · `.slides > section` · `section.slide` · `div.slide` · `.slide` · `[data-slide]` · `body > section` · `main > section` · `.step` · `body > article` · the element with the most `<section>` children · finally a group of sibling elements with the same tag and class that are each about the size of the page, or shown one at a time.
 
 If the deck hides inactive slides until they get a class such as `active`, `on` or `current`, the app works out which class it is and uses it.
 
@@ -113,23 +148,32 @@ If the deck hides inactive slides until they get a class such as `active`, `on` 
 
 ## Security
 
-A deck runs its own JavaScript inside the app, just as it would in a browser. It can read files in **its own folder and subfolders** (so `assets/` work) and nothing else on your disk. It can also reach the network, for web fonts and the like. Open decks you would also open in a browser.
+A deck runs its own JavaScript inside the app, just as it would in a browser. What it can't do:
+
+- **Reach the app.** The deck is served from its own origin (`hpres://deck`), separate from the app's interface (`hpres://app`). It can't call the app's API, open other files, or save. The app and the deck talk only through `postMessage`, and both sides check where each message comes from. What the deck reports about itself (slide count, titles, notes) is type-checked and only ever shown as text.
+- **Write to your file.** A deck's scripts can post the same messages as the app's own editing code. The app accepts a text edit only in edit mode, for a text you started editing, and only if the change is plain text (it may remove elements or add line breaks, never add markup).
+- **Read files outside its folder.** It can read files in its own folder and subfolders, so `assets/` work. Paths are resolved through symlinks before the check, so a link in the folder can't point it elsewhere.
+- **Navigate the app away.** Links to websites open in your default browser. A deck can't open new app windows. Its own iframes (a YouTube embed, a local demo) load inside it as they would in a browser.
+
+It can reach the network, for web fonts and the like. Open decks you would also open in a browser.
 
 ## How it works
 
 - The deck is loaded once per view (main view, presenter's current and next slide, audience window). [`controller.js`](src/renderer/controller.js) is injected first in `<head>`. It finds the slides and catches the keyboard so the deck's own navigation never fires. It then shows one slide at a time, pinned to a box the size of the slide. The app scales that box to fit.
 - Thumbnails are rendered in a hidden window that steps through the slides and captures each one.
-- **Edits are surgical.** On open, every element in `<body>` gets a `data-hp-id` attribute in an in-memory copy of the source ([`deckstore.mjs`](src/main/deckstore.mjs)). An edit rewrites only the inside of that one element in the copy. Saving removes exactly the attributes that were added. Everything you didn't touch is written back unchanged.
+- **Edits are surgical.** On open, every element in `<body>` gets a `data-hp-id` attribute in an in-memory copy of the source ([`deckstore.mjs`](src/main/deckstore.mjs)). An edit replaces only the inside of that one element in the copy, and only if the source still matches what the browser shows. Moving or deleting a slide cuts and pastes the slide's exact source text. Saving removes exactly the attributes that were added, so everything you didn't touch is written back unchanged.
+- **Inserted slides** are read straight from the other file's source. For *keep the original look*, the other deck is loaded in a hidden window and the browser itself reports which CSS rules apply to the chosen slides ([`importer.mjs`](src/main/importer.mjs)).
 
 | File | Role |
 |---|---|
-| `src/main/main.mjs` | Windows, displays, menus, the `hpres://` file server, file watching |
-| `src/main/deckstore.mjs` | Source text, element markers, edits, undo, save |
+| `src/main/main.mjs` | Windows, displays, menus, the `hpres://` file server, file watching, IPC |
+| `src/main/deckstore.mjs` | Source text, element markers, edits, slide moves, undo, save |
+| `src/main/importer.mjs` | Inserting slides from another deck: styles, assets, adapting to this deck |
 | `src/main/thumbs.mjs` | Thumbnails in a hidden window |
 | `src/main/preload.cjs` | The API the app's UI uses to talk to the main process |
-| `src/renderer/controller.js` | Runs inside the deck: slides, navigation, media, editing |
+| `src/renderer/controller.js` | Runs inside the deck: slides, navigation, media, editing, style collection |
 | `src/renderer/slideview.js` | One scaled view of a live deck |
-| `src/renderer/app.js` | Main window: start screen, normal view, grid, editing, presenter view |
+| `src/renderer/app.js` | Main window: start screen, normal view, grid, editing, rearranging, presenter view |
 | `src/renderer/audience.*` | The audience window |
 
 ## Development
@@ -138,12 +182,24 @@ A deck runs its own JavaScript inside the app, just as it would in a browser. It
 npm start                               # run from source
 npm run dual                            # audience window as a normal window, to test two screens on one
 npm test -- examples/demo-deck.html     # end-to-end test on a copy of a deck
+node scripts/unit-deckstore.mjs         # unit tests for source editing and slide moves
 node scripts/screenshots.mjs            # regenerate the screenshots in docs/
 npx electron scripts/make-icon.cjs      # redraw the app icon
 npm run package                         # build into dist/ without installing
 ```
 
-`npm test` drives the real app with Playwright. It opens a copy of the deck and checks that the deck can only read files in its own folder. It steps through the views, edits a text and saves, then checks that only those bytes changed. It deletes an element, undoes, and presents with an audience window. It never touches the file you pass in. Set `HP_EXEC` to the path of a built app's binary to test the packaged app instead of the source.
+`npm test` drives the real app with Playwright on a copy of the deck you pass in; it never touches the original. It checks that:
+
+- the views, thumbnails and arrow keys work;
+- the deck can read files in its own folder, but not outside it, not through a symlink, and can't reach the app;
+- messages forged by the deck's own script change nothing, and iframes inside the deck still load;
+- editing a text and saving changes only that text in the file, and deleting an element can be undone;
+- dragging thumbnails and the Slides menu reorder, duplicate and delete slides, and undo walks all of it back;
+- inserting a slide from a differently designed deck keeps its look, copies its image and brings its note, and moving one removes it from the other file with a backup; moving every slide out of a deck is refused without changing anything;
+- a second ⌘D pressed before the views reload can't corrupt the deck;
+- presenting opens an audience window that follows the presenter.
+
+Set `HP_EXEC` to the path of a built app's binary to test the packaged app instead of the source. The unit tests cover the source-editing rules: byte-identical round trips, slide moves with comments and notes, text between slides surviving deletes and copies, notes in every supported form (including ones containing `</script>`), refusing edits that would save script output or add markup, UTF-8 BOMs, read-only non-UTF-8 files, unique backups, and what an imported slide may copy and how its styles are scoped.
 
 ## Status
 

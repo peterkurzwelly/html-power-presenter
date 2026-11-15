@@ -12,12 +12,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { DeckStore } from './deckstore.mjs';
+import { DeckStore, extractSlides, planRemoveSlidesFromFile, applyRemovePlan, readText } from './deckstore.mjs';
 import { ThumbRenderer } from './thumbs.mjs';
+import { adaptChunk, classCoverage, deckCssText, makeUrlRewriter } from './importer.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHEME = 'hpres';
-const ORIGIN = `${SCHEME}://app`;
+const ORIGIN = `${SCHEME}://app`;        // appens eget UI
+const DECK_ORIGIN = `${SCHEME}://deck`;  // det öppna decket (egen origin: når inte appen)
+const SOURCE_ORIGIN = `${SCHEME}://source`; // decket du hämtar slides från
 const UI_DIR = path.join(__dirname, '..', 'renderer');
 const PRELOAD = path.join(__dirname, 'preload.cjs');
 const CONTROLLER_URL = `${ORIGIN}/ui/controller.js`;
@@ -39,21 +42,31 @@ let pendingOpen = null;
 let watcher = null;
 let quitting = false;
 
-const deck = new DeckStore({ backupDir: path.join(app.getPath('userData'), 'Säkerhetskopior') });
+const BACKUP_DIR = path.join(app.getPath('userData'), 'Säkerhetskopior');
+const deck = new DeckStore({ backupDir: BACKUP_DIR });
 const thumbs = new ThumbRenderer((t) => send(mainWin, 'thumb', t));
+let importer = null; // { store, thumbs, path, text, token, info }
 
 /* ------------------------------------------------------------------ helpers */
 
 function send(win, channel, payload) {
-  if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
+  if (!win || win.isDestroyed()) return;
+  const wc = win.webContents;
+  if (wc.isDestroyed() || wc.isCrashed()) return;
+  wc.send(channel, payload);
 }
 
-function deckBaseUrl(p) {
-  return `${ORIGIN}/fs${p.split('/').map(encodeURIComponent).join('/')}`;
+function deckBaseUrl(p, origin = DECK_ORIGIN) {
+  return `${origin}/fs${p.split('/').map(encodeURIComponent).join('/')}`;
 }
+
+// Regeln som hittade slidesen i appens vy (t.ex. "section.slide"), så att publikfönstret
+// och miniatyrerna delar upp decket på samma sätt även när bara en slide finns kvar.
+let deckHpsel = null;
+const setHpsel = (v) => { deckHpsel = typeof v === 'string' && /^[\w .>\[\]-]{1,100}$/.test(v) ? v : null; };
 
 function deckUrl(mode) {
-  return `${deckBaseUrl(deck.path)}?hp=${mode}&rev=${deck.rev}`;
+  return `${deckBaseUrl(deck.path)}?hp=${mode}&rev=${deck.rev}${deckHpsel ? '&hpsel=' + encodeURIComponent(deckHpsel) : ''}`;
 }
 
 function publicState(extra = {}) {
@@ -120,32 +133,64 @@ function isInside(file, dir) {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+// Ett decks skript får bara läsa filer i deckets egen mapp (och undermappar).
+// Symlänkar löses upp först, så en länk i mappen kan inte peka ut på disken.
+function serveDeckFile(store, u, p, req) {
+  if (!store || !store.path || !p.startsWith('/fs/')) return new Response('Hittades inte', { status: 404 });
+  const abs = path.normalize(p.slice(3));
+  if (u.searchParams.has('hp') && abs === store.path) {
+    return new Response(store.servedHtml(CONTROLLER_URL), {
+      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+    });
+  }
+  let real, root;
+  try { root = fs.realpathSync(path.dirname(store.path)); } catch { return new Response('Nej', { status: 403 }); }
+  try { real = fs.realpathSync(abs); } catch { return new Response('Hittades inte', { status: 404 }); }
+  if (!isInside(real, root)) return new Response('Utanför deckets mapp', { status: 403 });
+  return serveFile(real, req);
+}
+
 function handleProtocol(req) {
   const u = new URL(req.url);
-  if (u.host !== 'app') return new Response('Okänd värd', { status: 404 });
   const p = decodeURIComponent(u.pathname);
-
-  if (p.startsWith('/ui/')) {
+  if (u.host === 'app') {
+    if (!p.startsWith('/ui/')) return new Response('Hittades inte', { status: 404 });
     const file = path.normalize(path.join(UI_DIR, p.slice(4)));
     if (!isInside(file, UI_DIR)) return new Response('Nej', { status: 403 });
     return serveFile(file, req);
   }
+  if (u.host === 'deck') return serveDeckFile(deck, u, p, req);
+  if (u.host === 'source') return serveDeckFile(importer && importer.store, u, p, req);
+  return new Response('Okänd värd', { status: 404 });
+}
 
-  if (p.startsWith('/fs/')) {
-    const abs = path.normalize(p.slice(3));
-    // Decket kör sina egna skript. De får bara läsa filer i deckets egen mapp
-    // (och undermappar), inte resten av disken.
-    if (!deck.path || !isInside(abs, path.dirname(deck.path))) {
-      return new Response('Utanför deckets mapp', { status: 403 });
-    }
-    if (u.searchParams.has('hp') && abs === deck.path) {
-      return new Response(deck.servedHtml(CONTROLLER_URL), {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
-      });
-    }
-    return serveFile(abs, req);
-  }
-  return new Response('Hittades inte', { status: 404 });
+// Länkar och nya fönster från ett deck öppnas i webbläsaren, aldrig i appen.
+function guardWindow(win, allowedPrefix) {
+  const wc = win.webContents;
+  wc.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  wc.on('will-navigate', (e, url) => {
+    if (!url.startsWith(allowedPrefix)) { e.preventDefault(); if (/^https?:/i.test(url)) shell.openExternal(url); }
+  });
+  wc.on('will-frame-navigate', (e) => {
+    if (e.isMainFrame) return;
+    // Bara appens egna ramar (decket som visas) vaktas. Ramar INUTI decket, som en
+    // YouTube- eller CodePen-inbäddning, får ladda som i en webbläsare.
+    const parent = e.frame && e.frame.parent;
+    if (parent && parent.parent) return;
+    const url = e.url || '';
+    if (url === 'about:blank') return;
+    try {
+      const u = new URL(url);
+      // (Nodes URL ger origin "null" för egna scheman, så jämför schema + värd.)
+      const origin = `${u.protocol}//${u.host}`;
+      if ((origin === DECK_ORIGIN || origin === SOURCE_ORIGIN) && u.searchParams.has('hp')) return;
+    } catch (_) { /* ogiltig adress */ }
+    e.preventDefault();
+    if (/^https?:/i.test(url)) shell.openExternal(url);
+  });
 }
 
 /* ------------------------------------------------------------------ recent */
@@ -177,7 +222,21 @@ function touchRecent(p, patch = {}) {
 
 /* ------------------------------------------------------------- open / save */
 
+// Be UI:t skicka en text du håller på att skriva innan vi kollar om något är osparat.
+let flushSeq = 0;
+function flushRenderer() {
+  if (!mainWin || mainWin.isDestroyed()) return Promise.resolve();
+  const id = ++flushSeq;
+  return new Promise((resolve) => {
+    const done = (e, got) => { if (got !== id || e.sender !== mainWin.webContents) return; ipcMain.removeListener('flushed', done); clearTimeout(t); resolve(); };
+    const t = setTimeout(() => { ipcMain.removeListener('flushed', done); resolve(); }, 1500);
+    ipcMain.on('flushed', done);
+    mainWin.webContents.send('flush', id);
+  });
+}
+
 async function confirmDiscard() {
+  await flushRenderer();
   if (!deck.dirty) return true;
   const { response } = await dialog.showMessageBox(mainWin, {
     type: 'warning',
@@ -198,7 +257,9 @@ async function openDeck(p) {
     dialog.showErrorBox('Kunde inte öppna filen', `Bara .html- och .htm-filer kan öppnas.\n\n${p}`);
     return null;
   }
-  if (deck.path && deck.path !== p && !(await confirmDiscard())) return null;
+  // Samma fil igen (Öppna senaste, Finder, dra in): visa den bara, kasta inte ändringar.
+  if (deck.path === p) { mainWin.show(); mainWin.focus(); return publicState(); }
+  if (deck.path && !(await confirmDiscard())) return null;
   if (presenting) stopPresenting();
   try {
     deck.load(p);
@@ -206,14 +267,25 @@ async function openDeck(p) {
     dialog.showErrorBox('Kunde inte öppna filen', `${p}\n\n${err.message}`);
     return null;
   }
+  setHpsel(null);
   const entry = touchRecent(p);
   watchFile(p);
+  closeImporter();
   thumbs.cancel();
   return pushState({ reload: true, lastIndex: entry.lastIndex || 0 });
 }
 
+async function reloadDeck() {
+  if (!deck.path) return null;
+  if (!(await confirmDiscard())) return null;
+  try { deck.load(deck.path); } catch (err) { dialog.showErrorBox('Kunde inte läsa filen', err.message); return null; }
+  return pushState({ reload: true });
+}
+
 function closeDeck() {
+  setHpsel(null);
   unwatch();
+  closeImporter();
   thumbs.cancel();
   deck.close();
   pushState({ reload: true });
@@ -270,10 +342,14 @@ function unwatch() {
   if (watcher) { watcher.close(); watcher = null; }
 }
 
+// Bevakar mappen i stället för filen: verktyg som skriver en ny fil och byter namn
+// på den ersätter filen, och då tappar en bevakning av själva filen spåret.
 function watchFile(p) {
   unwatch();
+  const name = path.basename(p);
   try {
-    watcher = fs.watch(p, () => {
+    watcher = fs.watch(path.dirname(p), (_event, filename) => {
+      if (filename && filename.toString() !== name) return;
       clearTimeout(watchTimer);
       watchTimer = setTimeout(() => onFileChanged(p), 350);
     });
@@ -283,9 +359,13 @@ function watchFile(p) {
 async function onFileChanged(p) {
   if (p !== deck.path || !fs.existsSync(p)) return;
   if (Date.now() - selfWrite < 1500) return;
-  let text;
-  try { text = fs.readFileSync(p, 'utf8'); } catch { return; }
-  if (text === deck.diskText) return;
+  const read = () => { try { return readText(p).text; } catch { return null; } };
+  if (read() === deck.diskText) return;
+  // En text du håller på att skriva räknas som en osparad ändring.
+  await flushRenderer();
+  if (p !== deck.path) return;
+  const text = read();
+  if (text == null || text === deck.diskText) return;
   if (deck.dirty) {
     const { response } = await dialog.showMessageBox(mainWin, {
       type: 'question',
@@ -303,14 +383,25 @@ async function onFileChanged(p) {
 
 /* ------------------------------------------------------------- presenting */
 
+// Vilken skärm som visar vad sparas som skärm-id, så att "Byt skärmar" alltid byter
+// och att en skärm som kopplas in eller ur inte flyttar presentatörsvyn till projektorn.
 function displaysFor() {
   const all = screen.getAllDisplays();
-  const presenterDisplay = screen.getDisplayMatching(mainWin.getBounds());
-  const others = all.filter((d) => d.id !== presenterDisplay.id);
-  let audienceDisplay = others[0] || presenterDisplay;
-  let pres = presenterDisplay;
-  if (presenting && presenting.swapped && others.length) [audienceDisplay, pres] = [pres, audienceDisplay];
-  return { all, presenterDisplay: pres, audienceDisplay, dual: others.length > 0 };
+  const byId = (id) => all.find((d) => d.id === id);
+  let pres = presenting && byId(presenting.presenterId);
+  let aud = presenting && byId(presenting.audienceId);
+  if (!pres) pres = screen.getDisplayMatching(presenting ? presenting.restore.bounds : mainWin.getBounds());
+  if (!aud || aud.id === pres.id) aud = all.find((d) => d.id !== pres.id) || pres;
+  if (presenting) { presenting.presenterId = pres.id; presenting.audienceId = aud.id; }
+  return { all, presenterDisplay: pres, audienceDisplay: aud, dual: aud.id !== pres.id };
+}
+
+function swapDisplays() {
+  if (!presenting) return;
+  displaysFor();
+  if (presenting.audienceId === presenting.presenterId) return;
+  [presenting.presenterId, presenting.audienceId] = [presenting.audienceId, presenting.presenterId];
+  layoutPresentation();
 }
 
 function createAudienceWindow() {
@@ -322,6 +413,7 @@ function createAudienceWindow() {
     title: 'Publik',
     webPreferences: { preload: PRELOAD, spellcheck: false, backgroundThrottling: false },
   });
+  guardWindow(win, `${ORIGIN}/ui/`);
   win.loadURL(`${ORIGIN}/ui/audience.html`);
   win.on('closed', () => {
     if (audienceWin === win) audienceWin = null;
@@ -366,12 +458,14 @@ function startPresenting({ rehearse = false } = {}) {
   if (presenting) { layoutPresentation(); return { ok: true }; }
   presenting = {
     rehearse,
-    swapped: false,
+    presenterId: null,
+    audienceId: null,
     blocker: powerSaveBlocker.start('prevent-display-sleep'),
     restore: { bounds: mainWin.getBounds(), maximized: mainWin.isMaximized(), simple: mainWin.isSimpleFullScreen() },
   };
   layoutPresentation();
   const { dual } = displaysFor();
+  updateMenu();
   return { ok: true, dual, rehearse, audience: !!audienceWin, fake: FAKE_DUAL };
 }
 
@@ -389,6 +483,7 @@ function stopPresenting() {
     mainWin.focus();
   }
   send(mainWin, 'present-stopped', {});
+  updateMenu();
 }
 
 function syncAudience(state) {
@@ -399,48 +494,194 @@ function syncAudience(state) {
 
 /* -------------------------------------------------------------------- IPC */
 
-function wireIpc() {
-  ipcMain.handle('open-dialog', () => showOpenDialog());
-  ipcMain.handle('open-path', (_e, p) => openDeck(p));
-  ipcMain.handle('close-deck', async () => { if (await confirmDiscard()) closeDeck(); });
-  ipcMain.handle('recent', () => readRecent());
-  ipcMain.handle('forget-recent', (_e, p) => writeRecent(readRecent().filter((r) => r.path !== p)));
-  ipcMain.handle('state', () => publicState());
-  ipcMain.handle('remember-index', (_e, i) => { if (deck.path) touchRecent(deck.path, { lastIndex: i }); });
-  ipcMain.handle('reveal', () => { if (deck.path) shell.showItemInFolder(deck.path); });
+// Bara appens egna sidor (hpres://app/ui/…) får prata med huvudprocessen, och de
+// flesta kanalerna bara från huvudfönstret. Publikfönstret får bara säga att det är
+// redo och skicka vidare tangenter.
+const fromApp = (e) => !!(e.senderFrame && e.senderFrame.origin === ORIGIN);
+const fromMain = (e) => fromApp(e) && !!mainWin && e.sender === mainWin.webContents;
+const fromAudience = (e) => fromApp(e) && !!audienceWin && e.sender === audienceWin.webContents;
 
-  ipcMain.handle('edit-inner', (_e, { id, html }) => {
-    try { deck.replaceInner(id, html); return pushState(); }
+function wireIpc() {
+  const handle = (channel, fn) => ipcMain.handle(channel, (e, ...a) => {
+    if (!fromMain(e)) throw new Error('Nekad');
+    return fn(e, ...a);
+  });
+  const on = (channel, allowed, fn) => ipcMain.on(channel, (e, ...a) => { if (allowed(e)) fn(e, ...a); });
+
+  handle('open-dialog', () => showOpenDialog());
+  handle('open-path', (_e, p) => openDeck(p));
+  handle('close-deck', async () => { if (await confirmDiscard()) closeDeck(); });
+  handle('reload-deck', () => reloadDeck());
+  handle('recent', () => readRecent());
+  handle('forget-recent', (_e, p) => writeRecent(readRecent().filter((r) => r.path !== p)));
+  handle('state', () => publicState());
+  handle('remember-index', (_e, i) => { if (deck.path) touchRecent(deck.path, { lastIndex: i }); });
+  handle('reveal', () => { if (deck.path) shell.showItemInFolder(deck.path); });
+
+  handle('can-edit', (_e, { id, html }) => {
+    try { return deck.readOnly ? { ok: false, reason: 'Filen är skrivskyddad (inte UTF-8).' } : deck.canEdit(id, html); }
+    catch (err) { return { ok: false, reason: err.message }; }
+  });
+  handle('edit-inner', (_e, { id, html, orig }) => {
+    try {
+      if (typeof html !== 'string' || typeof orig !== 'string') throw new Error('Ogiltig ändring.');
+      deck.replaceInner(id, html, orig);
+      return pushState();
+    }
     catch (err) { return { error: err.message }; }
   });
-  ipcMain.handle('edit-remove', (_e, { id }) => {
+  handle('edit-remove', (_e, { id }) => {
     try { deck.remove(id); return pushState(); }
     catch (err) { return { error: err.message }; }
   });
-  ipcMain.handle('undo', () => { const ok = deck.undo(); return pushState({ reload: ok }); });
-  ipcMain.handle('redo', () => { const ok = deck.redo(); return pushState({ reload: ok }); });
-  ipcMain.handle('save', () => doSave());
-  ipcMain.handle('save-as', () => doSaveAs());
+  handle('undo', () => { const ok = deck.undo(); return pushState({ reload: ok }); });
+  handle('redo', () => { const ok = deck.redo(); return pushState({ reload: ok }); });
+  handle('save', () => doSave());
+  handle('save-as', () => doSaveAs());
 
-  ipcMain.handle('thumbs', (_e, { token, indices }) => {
+  handle('thumbs', (_e, { token, indices, hpsel }) => {
     if (!deck.path) return;
+    setHpsel(hpsel);
     thumbs.render(deckUrl('thumb'), token, indices || null);
   });
 
-  ipcMain.handle('present-start', (_e, opts) => startPresenting(opts));
-  ipcMain.handle('present-stop', () => stopPresenting());
-  ipcMain.handle('present-swap', () => {
-    if (!presenting) return;
-    presenting.swapped = !presenting.swapped;
-    layoutPresentation();
-  });
-  ipcMain.on('present-sync', (_e, state) => syncAudience(state));
-  ipcMain.on('audience-ready', () => syncAudience(lastSync));
-  ipcMain.on('audience-key', (_e, k) => send(mainWin, 'remote-key', k));
-  ipcMain.handle('displays', () => {
+  handle('present-start', (_e, opts) => { setHpsel(opts && opts.hpsel); return startPresenting(opts); });
+  handle('present-stop', () => stopPresenting());
+  handle('present-swap', () => swapDisplays());
+  on('present-sync', fromMain, (_e, state) => syncAudience(state));
+  on('audience-ready', fromAudience, () => syncAudience(lastSync));
+  on('audience-key', fromAudience, (_e, k) => send(mainWin, 'remote-key', k));
+  handle('displays', () => {
     const all = screen.getAllDisplays();
     return { count: all.length, fakeDual: FAKE_DUAL };
   });
+
+  // Slides: ordning, duplicering, borttagning (ids = alla slides i nuvarande ordning).
+  // `rev` är versionen som UI:ts slide-lista hör till. Har decket ändrats sedan dess
+  // (t.ex. två ⌘D i snabb följd) stämmer inte id:na längre, och då görs ingenting.
+  const slideOp = (rev, fn) => {
+    if (rev !== deck.rev) return { error: 'Vänta tills presentationen har laddats om och försök igen.', stale: true };
+    try { fn(); return pushState({ reload: true }); }
+    catch (err) { return { error: err.message }; }
+  };
+  handle('slides-reorder', (_e, { ids, order, rev }) => slideOp(rev, () => deck.reorderSlides(ids, order)));
+  handle('slides-remove', (_e, { ids, indices, rev }) => slideOp(rev, () => deck.removeSlides(ids, indices)));
+  handle('slides-duplicate', (_e, { ids, index, rev }) => slideOp(rev, () => deck.duplicateSlide(ids, index)));
+
+  // Hämta slides från ett annat deck.
+  handle('import-pick', () => importPick());
+  handle('import-cancel', () => closeImporter());
+  handle('import-run', (_e, opts) => importRun(opts));
+}
+
+/* ------------------------------------------------- slides från ett annat deck */
+
+function closeImporter() {
+  if (!importer) return;
+  importer.thumbs.destroy();
+  importer = null;
+}
+
+async function importPick() {
+  if (!deck.path) return null;
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWin, {
+    title: 'Infoga slides från en annan presentation',
+    buttonLabel: 'Välj',
+    properties: ['openFile'],
+    filters: [{ name: 'HTML-presentationer', extensions: ['html', 'htm'] }],
+  });
+  if (canceled || !filePaths[0]) return null;
+  const p = path.resolve(filePaths[0]);
+  if (p === deck.path) {
+    await dialog.showMessageBox(mainWin, {
+      type: 'info',
+      message: 'Det är presentationen du redan har öppen.',
+      detail: 'Använd Duplicera slide (⌘D) för att kopiera en slide inom samma presentation.',
+    });
+    return null;
+  }
+  closeImporter();
+  const store = new DeckStore({ backupDir: BACKUP_DIR });
+  try { store.load(p); } catch (err) { dialog.showErrorBox('Kunde inte öppna filen', `${p}\n\n${err.message}`); return null; }
+  const token = `imp-${Date.now()}`;
+  const imp = { store, path: p, text: store.diskText, token, info: null };
+  imp.thumbs = new ThumbRenderer(
+    (t) => { if (importer === imp) send(mainWin, 'import-thumb', t); },
+    ({ info }) => { if (importer === imp) { imp.info = info; send(mainWin, 'import-info', { token, info }); } },
+  );
+  importer = imp;
+  imp.thumbs.render(`${deckBaseUrl(p, SOURCE_ORIGIN)}?hp=thumb&rev=${store.rev}`, token);
+  const coverage = classCoverage(store.diskText, deckCssText(deck.inst, deck.path));
+  return {
+    token,
+    path: p,
+    name: path.basename(p),
+    sameFolder: path.dirname(p) === path.dirname(deck.path),
+    suggestKeepStyles: coverage < 0.9,
+  };
+}
+
+async function importRun({ token, indices, after, move, keepStyles, target, rev } = {}) {
+  const imp = importer;
+  if (!imp || imp.token !== token || !imp.info) return { error: 'Förhandsvisningen är inte klar än.' };
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  if (rev !== deck.rev) return { error: 'Vänta tills presentationen har laddats om och försök igen.', stale: true };
+  if (!target || !Array.isArray(target.ids) || !target.ids.length || target.ids.some((x) => x == null)) {
+    return { error: 'Den öppna presentationens slides kunde inte kopplas till källfilen.' };
+  }
+  const list = [...new Set(indices || [])].filter((i) => Number.isInteger(i) && i >= 0 && i < imp.info.count).sort((a, b) => a - b);
+  if (!list.length) return { error: 'Välj minst en slide.' };
+  let inserted = false;
+  try {
+    if (readText(imp.path).text !== imp.text) throw new Error(`”${path.basename(imp.path)}” har ändrats sedan du valde den. Välj filen igen.`);
+    const srcIds = imp.info.ids;
+    if (!srcIds || srcIds.some((x) => x == null)) throw new Error('Slidesen i den andra presentationen kunde inte kopplas till dess källfil.');
+    if (move && deck.readOnly) throw new Error('Den här presentationen är skrivskyddad.');
+    // Flytta: räkna ut hur den andra filen ska se ut innan något ändras, så att ett
+    // fel (t.ex. att alla slides skulle tas bort) stoppar allt i stället för halvvägs.
+    const plan = move ? planRemoveSlidesFromFile(imp.path, srcIds, list, imp.text) : null;
+    const raw = extractSlides(imp.store.inst, srcIds, list);
+    const targetCss = deckCssText(deck.inst, deck.path);
+    const styles = keepStyles ? await imp.thumbs.exec(`window.__hp.collectStyles(${JSON.stringify(list.map((i) => srcIds[i]))})`) : null;
+    const copied = [];
+    const srcName = path.basename(imp.path);
+    const rewrite = makeUrlRewriter(path.dirname(imp.path), path.dirname(deck.path), srcName, copied);
+    const stamp = Date.now().toString(36);
+    const chunks = raw.map((html, k) => adaptChunk(html, {
+      target: { slideTag: target.slideTag, commonClasses: target.commonClasses || [], strategy: target.strategy, size: target.size, css: targetCss },
+      style: styles ? styles[k] : null,
+      source: { name: srcName, size: imp.info.size, activeClasses: imp.info.activeClasses || [] },
+      // Anteckningar som låg i källdeckets JSON-lista följer med som <aside>, om
+      // inte det här decket också har en lista (då läggs de in där).
+      note: imp.info.jsonNotes && !target.jsonNotes ? (imp.info.notes[list[k]] || '') : '',
+      scopeClass: `hp-imp-${stamp}${k}`,
+      rewrite,
+    }));
+    const at = Number.isInteger(after) ? Math.max(-1, Math.min(target.ids.length - 1, after)) : target.ids.length - 1;
+    deck.insertSlides(target.ids, at, chunks, list.map((i) => imp.info.notes[i] || ''));
+    inserted = true;
+    let moved = false;
+    if (move) {
+      // Spara först det här decket, ta sedan bort slidesen ur det andra.
+      selfWrite = Date.now();
+      deck.save();
+      try {
+        applyRemovePlan(plan, BACKUP_DIR);
+      } catch (err) {
+        throw new Error(`Slidesen lades in här och presentationen sparades, men de kunde inte tas bort ur ”${srcName}”: ${err.message}`);
+      }
+      moved = true;
+      // Den andra filen är redan ändrad på disk, så ⌘Z här skulle bara ta bort slidesen
+      // ur det här decket. Därför går en flytt inte att ångra (kopiorna finns kvar).
+      deck.undoStack = [];
+      deck.redoStack = [];
+    }
+    return { ok: true, count: chunks.length, copied, styled: !!styles, moved, at, from: srcName };
+  } catch (err) {
+    return { error: err.message, inserted };
+  } finally {
+    if (inserted) { closeImporter(); pushState({ reload: true }); }
+  }
 }
 
 /* ------------------------------------------------------------------- menu */
@@ -495,13 +736,27 @@ function updateMenu() {
       ],
     },
     {
+      label: 'Slides',
+      submenu: [
+        { label: 'Duplicera slide', accelerator: 'CmdOrCtrl+D', enabled: open, click: menuAction('slide-duplicate') },
+        { label: 'Ta bort slide', enabled: open, click: menuAction('slide-delete') },
+        { type: 'separator' },
+        { label: 'Flytta slide uppåt', accelerator: 'Alt+CmdOrCtrl+Up', enabled: open, click: menuAction('slide-up') },
+        { label: 'Flytta slide nedåt', accelerator: 'Alt+CmdOrCtrl+Down', enabled: open, click: menuAction('slide-down') },
+        { label: 'Flytta slide först', accelerator: 'Shift+Alt+CmdOrCtrl+Up', enabled: open, click: menuAction('slide-first') },
+        { label: 'Flytta slide sist', accelerator: 'Shift+Alt+CmdOrCtrl+Down', enabled: open, click: menuAction('slide-last') },
+        { type: 'separator' },
+        { label: 'Infoga slides från annan presentation…', accelerator: 'Shift+CmdOrCtrl+I', enabled: open, click: menuAction('import') },
+      ],
+    },
+    {
       label: 'Bildspel',
       submenu: [
         { label: 'Presentera från början', accelerator: 'Shift+CmdOrCtrl+Enter', enabled: open, click: menuAction('present-start') },
         { label: 'Presentera från aktuell slide', accelerator: 'CmdOrCtrl+Enter', enabled: open, click: menuAction('present-current') },
         { label: 'Öva med presentatörsvy', accelerator: 'Alt+CmdOrCtrl+Enter', enabled: open, click: menuAction('present-rehearse') },
         { type: 'separator' },
-        { label: 'Byt skärmar', enabled: !!presenting, click: () => { if (presenting) { presenting.swapped = !presenting.swapped; layoutPresentation(); } } },
+        { label: 'Byt skärmar', enabled: !!presenting, click: () => swapDisplays() },
       ],
     },
     { role: 'windowMenu', label: 'Fönster' },
@@ -523,18 +778,13 @@ function createMainWindow() {
   });
   mainWin.loadURL(`${ORIGIN}/ui/index.html`);
   mainWin.once('ready-to-show', () => mainWin.show());
-  mainWin.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:/i.test(url)) shell.openExternal(url);
-    return { action: 'deny' };
-  });
-  // Länkar i decks ska inte ta över appfönstret.
-  mainWin.webContents.on('will-navigate', (e, url) => {
-    if (!url.startsWith(`${ORIGIN}/ui/`)) { e.preventDefault(); if (/^https?:/i.test(url)) shell.openExternal(url); }
-  });
+  guardWindow(mainWin, `${ORIGIN}/ui/`);
+  let closeConfirmed = false;
   mainWin.on('close', async (e) => {
-    if (quitting || !deck.dirty) return;
+    if (closeConfirmed || !deck.path) return;
     e.preventDefault();
-    if (await confirmDiscard()) { deck.savedInst = deck.inst; mainWin.close(); }
+    if (await confirmDiscard()) { closeConfirmed = true; mainWin.close(); }
+    else quitting = false;
   });
   mainWin.on('closed', () => {
     mainWin = null;
@@ -580,7 +830,7 @@ if (!app.requestSingleInstanceLock()) {
     screen.on('display-removed', relayout);
   });
 
-  app.on('before-quit', () => { quitting = !deck.dirty; });
+  app.on('before-quit', () => { quitting = true; });
   app.on('window-all-closed', () => app.quit());
   app.on('activate', () => { if (!mainWin) createMainWindow(); });
 }

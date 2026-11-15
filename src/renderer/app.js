@@ -1,5 +1,6 @@
 // app.js — huvudfönstrets UI: startsida, normalvy, rutnät, redigering och presentatörsvy.
 import { SlideView } from './slideview.js';
+import { cleanInfo } from './deckinfo.mjs';
 
 const $ = (id) => document.getElementById(id);
 const hp = window.hp;
@@ -19,6 +20,14 @@ const state = {
   blank: null,         // 'black' | 'white' | null
   gotoBuf: '',
   selection: null,
+  pending: null,       // väntad slide och miniatyrer efter att slides flyttats
+  imp: null,           // pågående import från ett annat deck
+  lastPane: 'stage',   // var du klickade senast: 'sidebar', 'grid' eller 'stage'
+  infoRev: -1,         // deckets version när state.info lästes (för slide-ändringar)
+  loading: false,      // vyn laddas om just nu
+  busy: false,         // en slide-ändring väntar på svar
+  hpsel: null,         // slide-regeln som hittade slidesen förra gången (samma fil)
+  thumbsSeen: new Set(), // miniatyrer som kommit för nuvarande token
 };
 
 const ui = {
@@ -30,7 +39,7 @@ const mainView = new SlideView($('stage'), { mode: 'main', interactive: true });
 let pCur = null;
 let pNext = null;
 
-const url = (mode) => `${state.deck.baseUrl}?hp=${mode}&rev=${state.deck.rev}`;
+const url = (mode) => `${state.deck.baseUrl}?hp=${mode}&rev=${state.deck.rev}${state.hpsel ? '&hpsel=' + encodeURIComponent(state.hpsel) : ''}`;
 const count = () => (state.info ? state.info.count : 0);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -92,6 +101,8 @@ document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) $('drop').
 document.addEventListener('drop', (e) => {
   e.preventDefault();
   $('drop').classList.remove('over');
+  if (dragFrom !== null) { dragFrom = null; clearDropMarks(); return; }
+  if (state.imp) { toast('Stäng dialogen först.', 'error'); return; }
   const file = [...(e.dataTransfer.files || [])].find((f) => /\.html?$/i.test(f.name));
   if (!file) { toast('Släpp en .html-fil.', 'error'); return; }
   hp.openPath(hp.pathForFile(file));
@@ -101,7 +112,10 @@ document.addEventListener('drop', (e) => {
 
 hp.onDeckState(async (s) => {
   state.deck = s.open ? s : null;
+  // Huvudprocessen har redan stängt importen när decket stängs eller byts.
+  if (state.imp && (!s.open || (s.reload && s.path !== state.loadedPath))) { state.imp = null; $('importDlg').hidden = true; }
   if (!s.open) {
+    state.loading = false;
     state.loadedPath = null;
     state.info = null;
     mainView.unload();
@@ -109,6 +123,8 @@ hp.onDeckState(async (s) => {
     renderRecent();
     return;
   }
+  // Spara som… byter filnamn utan att ladda om: det är fortfarande samma deck.
+  if (!s.reload && state.loadedPath && s.path !== state.loadedPath) state.loadedPath = s.path;
   updateChrome();
   if (s.reload) await loadDeck(s);
 });
@@ -119,6 +135,8 @@ function updateChrome() {
   $('docName').textContent = d.name;
   $('docName').parentElement.title = d.path;
   $('dirtyMark').hidden = !d.dirty;
+  $('readOnlyMark').hidden = !d.readOnly;
+  $('editBtn').disabled = !!d.readOnly;
   $('saveBtn').disabled = !d.dirty;
   $('undoBtn').disabled = !d.canUndo;
   $('redoBtn').disabled = !d.canRedo;
@@ -126,10 +144,17 @@ function updateChrome() {
 
 async function loadDeck(s) {
   const sameFile = state.loadedPath === s.path;
-  const startIndex = sameFile ? state.index : (s.lastIndex || 0);
+  const pending = sameFile ? state.pending : null;
+  state.pending = null;
+  const startIndex = pending ? pending.index : sameFile ? state.index : (s.lastIndex || 0);
+  const oldIds = sameFile && state.info ? state.info.ids.join(',') : null;
   state.loadedPath = s.path;
   state.token += 1;
-  if (!sameFile) { state.thumbs = []; state.selection = null; hideSelTools(); }
+  state.thumbsSeen = new Set();
+  state.loading = true;
+  if (!sameFile) { state.thumbs = []; state.hpsel = null; }
+  state.selection = null;
+  hideSelTools();
   if (!state.presenting) showScreen('workspace');
   $('stageMsg').hidden = true;
 
@@ -137,26 +162,33 @@ async function loadDeck(s) {
   try {
     info = await mainView.load(url('main'), startIndex);
   } catch (err) {
+    state.loading = false;
     $('stageMsg').textContent = 'Kunde inte visa presentationen: ' + err.message;
     $('stageMsg').hidden = false;
     return;
   }
   if (!info) return; // ersatt av en nyare laddning
   const countChanged = !state.info || state.info.count !== info.count;
+  // Samma antal men annan ordning (t.ex. ⌘Z efter en flytt): miniatyrerna stämmer inte.
+  const orderChanged = oldIds !== null && info.ids.join(',') !== oldIds;
   state.info = info;
+  state.infoRev = s.rev;
+  state.loading = false;
+  state.hpsel = info.whole ? null : info.strategy;
   document.documentElement.style.setProperty('--ratio', String(info.size.w / info.size.h));
-  if (!sameFile || countChanged) { state.thumbs = []; buildThumbLists(); }
+  if (pending && pending.thumbs && pending.thumbs.length === info.count) { state.thumbs = pending.thumbs; buildThumbLists(); }
+  else if (!sameFile || countChanged || pending || orderChanged) { state.thumbs = []; buildThumbLists(); }
   else refreshTitles();
 
   state.index = -1;
   go(clamp(startIndex, 0, info.count - 1));
-  if (state.edit) mainView.api.setEdit(true);
+  if (state.edit) mainView.call('setEdit', true);
   $('statusMid').textContent = info.whole
     ? 'Hittade inga separata slides — visar hela sidan'
     : `${info.count} slides · ${info.size.w}×${info.size.h} · hittade via ${info.strategy}`;
   $('gridInfo').textContent = `${info.count} slides`;
 
-  hp.requestThumbs(state.token, null);
+  hp.requestThumbs(state.token, null, state.hpsel);
 
   if (state.presenting) {
     await loadPresenterViews(true);
@@ -197,10 +229,13 @@ function buildThumbLists() {
     li.appendChild(thumbFigure(i));
     li.addEventListener('click', () => go(i));
     li.addEventListener('dblclick', () => startPresenting({ from: i }));
+    makeDraggable(li, i, 'y');
     ui.thumbList.appendChild(li);
 
     // Rutnät
-    ui.gridList.appendChild(gridItem(i, () => go(i), () => { go(i); setView('normal'); }));
+    const g = gridItem(i, () => go(i), () => { go(i); setView('normal'); });
+    makeDraggable(g, i, 'x');
+    ui.gridList.appendChild(g);
     // Presentatörens remsa och rutnät
     const s = document.createElement('li');
     s.dataset.i = i;
@@ -241,6 +276,7 @@ function refreshTitles() {
 hp.onThumb((t) => {
   if (t.token !== state.token) return;
   state.thumbs[t.index] = t.url;
+  state.thumbsSeen.add(t.index);
   document.querySelectorAll(`.thumb[data-fig="${t.index}"]`).forEach((fig) => {
     let img = fig.querySelector('img');
     if (!img) { img = document.createElement('img'); fig.prepend(img); }
@@ -256,7 +292,10 @@ function queueThumb(i) {
   thumbTimer = setTimeout(() => {
     const list = [...thumbQueue];
     thumbQueue = new Set();
-    hp.requestThumbs(state.token, list);
+    // Saknas fortfarande miniatyrer från första genomgången: rendera alla igen,
+    // annars skulle den här beställningen avbryta resten.
+    const missing = state.thumbsSeen.size < count();
+    hp.requestThumbs(state.token, missing ? null : list, state.hpsel);
   }, 500);
 }
 
@@ -319,12 +358,13 @@ function toggleNotes() {
 
 function setEdit(on) {
   if (!state.info) return;
+  if (on && state.deck && state.deck.readOnly) { toast('Filen är inte sparad som UTF-8 och är därför skrivskyddad.', 'error'); return; }
   if (on && state.info.whole) { toast('Redigering kräver att decket har separata slides.', 'error'); return; }
   state.edit = !!on;
   $('editBtn').classList.toggle('on', state.edit);
   $('editBar').hidden = !state.edit;
   if (state.edit && state.view !== 'normal') setView('normal');
-  if (mainView.api) mainView.api.setEdit(state.edit);
+  mainView.call('setEdit', state.edit);
   if (!state.edit) hideSelTools();
   mainView.focus();
 }
@@ -332,14 +372,54 @@ function setEdit(on) {
 $('editBtn').addEventListener('click', () => setEdit(!state.edit));
 $('editDone').addEventListener('click', () => setEdit(false));
 
-mainView.on('edit', async (e) => {
-  const res = await hp.editInner(e.id, e.html);
-  if (res && res.error) {
-    toast('Ändringen kunde inte sparas: ' + res.error, 'error');
-    await reloadAll();
-    return;
-  }
-  queueThumb(e.slide);
+// När du börjar skriva i en text: går den att spara säkert? (Inte om deckets egna
+// skript har ändrat den, t.ex. formler eller kodfärgning.)
+// Händelser från decket kan komma från deckets egna skript, så appen godtar bara en
+// ändring när du är i redigeringsläge och har börjat redigera just den texten.
+let editCheck = null;   // { id, ok: Promise<boolean> } för texten du redigerar
+let pendingEdit = Promise.resolve();
+mainView.on('editBegin', (d) => {
+  if (!state.edit || !d || typeof d.id !== 'string' || typeof d.html !== 'string') { mainView.call('cancelEdit', d && d.id); return; }
+  const check = { id: d.id, ok: hp.canEdit(d.id, d.html).then((r) => !!(r && r.ok) || (toast(r ? r.reason : 'Texten kan inte redigeras här.', 'error'), mainView.call('cancelEdit', d.id), false)) };
+  editCheck = check;
+});
+
+// Skickar en pågående textändring och väntar tills huvudprocessen har tagit emot den.
+async function commitPending() {
+  if (mainView.ready) await mainView.call('commit');
+  await pendingEdit;
+}
+
+// Huvudprocessen ber om en pågående textändring innan den stänger eller öppnar något.
+hp.onFlush(async (id) => {
+  await commitPending().catch(() => {});
+  hp.flushed(id);
+});
+
+mainView.on('edit', (e) => {
+  const check = editCheck;
+  if (!e || typeof e.html !== 'string' || typeof e.orig !== 'string' || !check || check.id !== e.id) return;
+  editCheck = null;
+  // Sliden där ändringen gjordes (du kan hinna byta slide innan den är sparad).
+  const slide = Number.isInteger(e.slide) && e.slide >= 0 && e.slide < count() ? e.slide : state.index;
+  pendingEdit = (async () => {
+    if (!(await check.ok)) return;
+    const res = await hp.editInner(e.id, e.html, e.orig);
+    if (res && res.error) {
+      toast('Ändringen kunde inte sparas: ' + res.error, 'error');
+      await reloadAll();
+      return;
+    }
+    queueThumb(slide);
+    // Rubriken kan ha ändrats: uppdatera titlar och anteckningar.
+    const fresh = await mainView.call('info').catch(() => null);
+    if (fresh && state.info) {
+      try {
+        const c = cleanInfo(fresh);
+        if (c.count === state.info.count) { state.info.titles = c.titles; state.info.notes = c.notes; refreshTitles(); }
+      } catch (_) { /* behåll de gamla */ }
+    }
+  })().catch(() => {});
 });
 
 mainView.on('select', (s) => {
@@ -350,7 +430,7 @@ mainView.on('select', (s) => {
   showSelTools(s);
 });
 
-mainView.on('requestDelete', () => deleteSelected());
+mainView.on('requestDelete', () => { if (state.edit) deleteSelected(); });
 
 function showSelTools(s) {
   const box = $('selTools');
@@ -372,31 +452,31 @@ function showSelTools(s) {
 function hideSelTools() { $('selTools').hidden = true; }
 
 async function deleteSelected() {
-  if (!mainView.api) return;
-  mainView.api.commit();
-  const id = mainView.api.selectedId();
+  if (!mainView.ready || !state.edit) return;
+  await commitPending();
+  const id = mainView.selection && mainView.selection.id;
   if (!id) return;
   const res = await hp.editRemove(id);
   if (res && res.error) { toast('Kunde inte ta bort: ' + res.error, 'error'); return; }
-  mainView.api.removeById(id);
+  mainView.call('removeById', id);
   hideSelTools();
   queueThumb(state.index);
   toast('Borttaget — ⌘Z ångrar.');
 }
 
 $('selDelete').addEventListener('click', deleteSelected);
-$('selParent').addEventListener('click', () => mainView.api && mainView.api.selectParent());
-$('selEdit').addEventListener('click', () => mainView.api && mainView.api.editSelected());
+$('selParent').addEventListener('click', () => mainView.call('selectParent'));
+$('selEdit').addEventListener('click', () => mainView.call('editSelected'));
 $('selTools').addEventListener('mousedown', (e) => e.preventDefault());
 
 // Klick utanför sliden avslutar redigeringen.
 $('stageWrap').addEventListener('mousedown', (e) => {
-  if (e.target === $('stageWrap') || e.target === $('stage')) { if (mainView.api) mainView.api.deselect(); }
+  if (e.target === $('stageWrap') || e.target === $('stage')) mainView.call('deselect');
 });
-$('sidebar').addEventListener('mousedown', () => { if (mainView.api) mainView.api.commit(); });
+$('sidebar').addEventListener('mousedown', () => { mainView.call('commit'); });
 
 async function undo(redo = false) {
-  if (mainView.api && mainView.api.editing) { mainView.api.execUndo(redo); return; }
+  if (mainView.editing) { mainView.call('execUndo', redo); return; }
   if (redo) await hp.redo(); else await hp.undo();
 }
 
@@ -405,8 +485,7 @@ $('redoBtn').addEventListener('click', () => undo(true));
 $('saveBtn').addEventListener('click', () => save());
 
 async function save(as = false) {
-  if (mainView.api) mainView.api.commit();
-  await new Promise((r) => setTimeout(r, 30)); // låt en pågående ändring hinna fram
+  await commitPending(); // en pågående textändring skickas före sparningen
   const ok = as ? await hp.saveAs() : await hp.save();
   if (ok) toast('Sparat ✓');
 }
@@ -418,6 +497,261 @@ async function reloadAll() {
   updateChrome();
   await loadDeck(s);
 }
+
+/* ======================================================== slide order */
+
+// Flytt, duplicering och borttagning sker i källfilen (huvudprocessen). Vyerna laddas
+// om efteråt; miniatyrerna flyttas med direkt så att inget blinkar.
+
+function canRestructure() {
+  const info = state.info;
+  if (state.deck && state.deck.readOnly) { toast('Filen är inte sparad som UTF-8 och är därför skrivskyddad.', 'error'); return false; }
+  if (state.loading || state.busy || !state.deck || state.deck.rev !== state.infoRev) { toast('Vänta tills presentationen har laddats om.', 'error'); return false; }
+  if (!info || info.whole) { toast('Det här decket har inga separata slides.', 'error'); return false; }
+  if (!info.siblings || !info.ids || info.ids.some((x) => x == null)) {
+    toast('Slidesen i det här decket ligger inte i samma behållare i källfilen, så ordningen kan inte ändras här.', 'error');
+    return false;
+  }
+  return true;
+}
+
+async function restructure(run, pending, message) {
+  if (!canRestructure()) return;
+  state.busy = true;
+  try {
+    await commitPending();
+    if (state.deck.rev !== state.infoRev) { toast('Vänta tills presentationen har laddats om.', 'error'); return; }
+    state.pending = pending;
+    const res = await run(state.info.ids, state.infoRev);
+    if (res && res.error) { state.pending = null; toast(res.error, 'error'); return; }
+    if (message) toast(message);
+  } finally {
+    state.busy = false;
+  }
+}
+
+// Flytta slide `from` till insättningsplats `to` (0…antal, räknat före flytten).
+function moveSlide(from, to) {
+  const n = count();
+  if (from < 0 || from >= n) return;
+  to = clamp(to, 0, n);
+  const dest = to > from ? to - 1 : to;
+  if (dest === from) return;
+  const order = [...Array(n).keys()];
+  order.splice(from, 1);
+  order.splice(dest, 0, from);
+  const thumbs = order.map((i) => state.thumbs[i]);
+  restructure((ids, rev) => hp.reorderSlides(ids, order, rev), { index: dest, thumbs }, `Slide ${from + 1} flyttad till plats ${dest + 1} — ⌘Z ångrar.`);
+}
+
+function duplicateSlide(i) {
+  if (i < 0 || i >= count()) return;
+  const thumbs = state.thumbs.slice();
+  thumbs.splice(i + 1, 0, state.thumbs[i]);
+  restructure((ids, rev) => hp.duplicateSlide(ids, i, rev), { index: i + 1, thumbs }, `Slide ${i + 1} duplicerad.`);
+}
+
+function deleteSlide(i) {
+  const n = count();
+  if (i < 0 || i >= n) return;
+  if (n <= 1) { toast('Ett deck måste ha minst en slide kvar.', 'error'); return; }
+  const thumbs = state.thumbs.slice();
+  thumbs.splice(i, 1);
+  restructure((ids, rev) => hp.removeSlides(ids, [i], rev), { index: Math.min(i, n - 2), thumbs }, `Slide ${i + 1} borttagen — ⌘Z ångrar.`);
+}
+
+/* ---- dra och släpp i sidopanelen och rutnätet */
+
+let dragFrom = null;
+
+function clearDropMarks() {
+  document.querySelectorAll('.drop-before, .drop-after, .dragging').forEach((el) => el.classList.remove('drop-before', 'drop-after', 'dragging'));
+}
+
+function makeDraggable(li, i, axis) {
+  li.draggable = true;
+  const before = (e) => {
+    const r = li.getBoundingClientRect();
+    return axis === 'y' ? e.clientY < r.top + r.height / 2 : e.clientX < r.left + r.width / 2;
+  };
+  li.addEventListener('dragstart', (e) => {
+    if (state.presenting) { e.preventDefault(); return; }
+    dragFrom = i;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', `slide ${i + 1}`);
+    li.classList.add('dragging');
+  });
+  li.addEventListener('dragend', () => { dragFrom = null; clearDropMarks(); });
+  li.addEventListener('dragover', (e) => {
+    if (dragFrom === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    const b = before(e);
+    li.parentElement.querySelectorAll('.drop-before, .drop-after').forEach((el) => { if (el !== li) el.classList.remove('drop-before', 'drop-after'); });
+    li.classList.toggle('drop-before', b);
+    li.classList.toggle('drop-after', !b);
+  });
+  li.addEventListener('drop', (e) => {
+    if (dragFrom === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const from = dragFrom;
+    const to = before(e) ? i : i + 1;
+    dragFrom = null;
+    clearDropMarks();
+    moveSlide(from, to);
+  });
+}
+
+// Var du klickade senast avgör om ⌫ tar bort en slide (sidopanel/rutnät) eller inte.
+$('sidebar').addEventListener('mousedown', () => { state.lastPane = 'sidebar'; });
+$('gridView').addEventListener('mousedown', () => { state.lastPane = 'grid'; });
+$('stageWrap').addEventListener('mousedown', () => { state.lastPane = 'stage'; });
+
+/* ============================================ slides från en annan presentation */
+
+async function openImport() {
+  if (!state.info || !canRestructure()) return;
+  await commitPending();
+  const res = await hp.importPick();
+  if (!res) return;
+  state.imp = { token: res.token, name: res.name, info: null, thumbs: [], sel: new Set(), anchor: null, at: state.index };
+  $('impName').textContent = res.name.replace(/\.html?$/i, '');
+  $('impMoveName').textContent = res.name;
+  $('impStyles').checked = !!res.suggestKeepStyles;
+  $('impStylesHint').textContent = res.suggestKeepStyles
+    ? 'Den här presentationen verkar ha en annan design. Med valet på ser sliden ut som i originalet.'
+    : 'Samma design som den här presentationen — sliden tar den här presentationens utseende.';
+  $('impMove').checked = false;
+  $('impWhere').options[0].textContent = `efter slide ${state.index + 1} (aktuell)`;
+  $('impWhere').value = 'after';
+  $('impGrid').innerHTML = '<li class="imp-wait">Laddar slides…</li>';
+  $('impFolderHint').hidden = !!res.sameFolder;
+  updateImportButton();
+  $('importDlg').hidden = false;
+  hideSelTools();
+}
+
+function closeImport() {
+  if (!state.imp) return;
+  state.imp = null;
+  $('importDlg').hidden = true;
+  hp.importCancel();
+}
+
+hp.onImportInfo(({ token, info }) => {
+  const imp = state.imp;
+  if (!imp || imp.token !== token) return;
+  imp.info = info;
+  const grid = $('impGrid');
+  grid.style.setProperty('--ratio', String(info.size.w / info.size.h));
+  grid.innerHTML = '';
+  if (info.whole || !info.count) {
+    grid.innerHTML = '<li class="imp-wait">Hittade inga separata slides i den filen.</li>';
+    return;
+  }
+  for (let i = 0; i < info.count; i++) {
+    const li = document.createElement('li');
+    li.dataset.i = i;
+    const fig = document.createElement('div');
+    fig.className = 'thumb';
+    fig.dataset.imp = i;
+    fig.innerHTML = '<div class="ph"></div><span class="check">✓</span>';
+    fig.querySelector('.ph').textContent = info.titles[i] || `Slide ${i + 1}`;
+    if (imp.thumbs[i]) { const img = document.createElement('img'); img.src = imp.thumbs[i]; fig.prepend(img); }
+    li.appendChild(fig);
+    li.insertAdjacentHTML('beforeend', `<div class="cap"><b>${i + 1}</b><span></span></div>`);
+    li.querySelector('.cap span').textContent = info.titles[i] || '';
+    li.addEventListener('click', (e) => toggleImportSel(i, e.shiftKey, e.metaKey));
+    grid.appendChild(li);
+  }
+  updateImportButton();
+});
+
+hp.onImportThumb((t) => {
+  const imp = state.imp;
+  if (!imp || t.token !== imp.token) return;
+  imp.thumbs[t.index] = t.url;
+  const fig = document.querySelector(`#impGrid .thumb[data-imp="${t.index}"]`);
+  if (!fig) return;
+  let img = fig.querySelector('img');
+  if (!img) { img = document.createElement('img'); fig.prepend(img); }
+  img.src = t.url;
+});
+
+function toggleImportSel(i, range) {
+  const imp = state.imp;
+  if (!imp) return;
+  if (range && imp.anchor !== null) {
+    const [a, b] = [Math.min(imp.anchor, i), Math.max(imp.anchor, i)];
+    for (let k = a; k <= b; k++) imp.sel.add(k);
+  } else {
+    if (imp.sel.has(i)) imp.sel.delete(i); else imp.sel.add(i);
+    imp.anchor = i;
+  }
+  document.querySelectorAll('#impGrid li').forEach((li) => li.classList.toggle('sel', imp.sel.has(+li.dataset.i)));
+  updateImportButton();
+}
+
+function updateImportButton() {
+  const n = state.imp ? state.imp.sel.size : 0;
+  const move = $('impMove').checked;
+  $('impGo').disabled = !n || !(state.imp && state.imp.info);
+  $('impGo').textContent = n ? `${move ? 'Flytta' : 'Infoga'} ${n} slide${n === 1 ? '' : 's'}` : 'Välj slides';
+}
+
+$('importBtn').addEventListener('click', openImport);
+$('impMove').addEventListener('change', updateImportButton);
+$('impCancel').addEventListener('click', closeImport);
+$('impClose').addEventListener('click', closeImport);
+$('impAll').addEventListener('click', () => {
+  const imp = state.imp;
+  if (!imp || !imp.info) return;
+  const all = imp.sel.size === imp.info.count;
+  imp.sel = all ? new Set() : new Set([...Array(imp.info.count).keys()]);
+  document.querySelectorAll('#impGrid li').forEach((li) => li.classList.toggle('sel', imp.sel.has(+li.dataset.i)));
+  updateImportButton();
+});
+
+$('impGo').addEventListener('click', async () => {
+  const imp = state.imp;
+  if (!imp || !imp.info || !imp.sel.size) return;
+  const indices = [...imp.sel].sort((a, b) => a - b);
+  const move = $('impMove').checked;
+  if (move && !confirm(`Flytta ${indices.length} slide${indices.length === 1 ? '' : 's'}?\n\nDen här presentationen sparas och slidesen tas bort ur ”${imp.name}”. Det går inte att ångra med ⌘Z, men säkerhetskopior av båda filerna sparas.`)) return;
+  if (state.loading || state.deck.rev !== state.infoRev) { toast('Vänta tills presentationen har laddats om.', 'error'); return; }
+  const where = $('impWhere').value;
+  const after = where === 'start' ? -1 : where === 'end' ? count() - 1 : clamp(imp.at, 0, count() - 1);
+  const info = state.info;
+  const thumbs = state.thumbs.slice();
+  thumbs.splice(after + 1, 0, ...indices.map((i) => imp.thumbs[i]));
+  state.pending = { index: after + 1, thumbs };
+  $('impGo').disabled = true;
+  $('impGo').textContent = 'Arbetar…';
+  const res = await hp.importRun({
+    token: imp.token,
+    indices,
+    after,
+    move,
+    keepStyles: $('impStyles').checked,
+    target: { ids: info.ids, slideTag: info.slideTag, commonClasses: info.commonClasses, strategy: info.strategy, size: info.size, jsonNotes: info.jsonNotes },
+    rev: state.infoRev,
+  });
+  if (!res || res.error) {
+    state.pending = null;
+    if (res && res.inserted) { state.imp = null; $('importDlg').hidden = true; }
+    else updateImportButton();
+    toast((res && res.error) || 'Något gick fel.', 'error');
+    return;
+  }
+  state.imp = null;
+  $('importDlg').hidden = true;
+  const bits = [`${res.moved ? 'Flyttade' : 'Infogade'} ${res.count} slide${res.count === 1 ? '' : 's'} från ${res.from}`];
+  if (res.copied.length) bits.push(`kopierade ${res.copied.length} fil${res.copied.length === 1 ? '' : 'er'} till mappen`);
+  bits.push(res.moved ? 'kan inte ångras, säkerhetskopior finns' : '⌘Z ångrar');
+  toast(bits.join(' · '));
+});
 
 /* ============================================================ presenting */
 
@@ -437,11 +771,11 @@ async function loadPresenterViews(force) {
 
 async function startPresenting({ from = 0, rehearse = false } = {}) {
   if (!state.info) return;
+  await commitPending();
   if (state.edit) setEdit(false);
-  if (mainView.api) mainView.api.commit();
   state.pIndex = clamp(from, 0, count() - 1);
   state.blank = null;
-  const res = await hp.presentStart({ rehearse });
+  const res = await hp.presentStart({ rehearse, hpsel: state.hpsel });
   if (!res) return;
   state.presenting = { rehearse, dual: res.dual };
   showScreen('presenter');
@@ -514,8 +848,12 @@ function pGo(i, force = false) {
 function renderCount() {
   const n = count();
   const ended = state.pIndex >= n;
-  const goto = state.gotoBuf ? `<span class="goto">Gå till ${state.gotoBuf}…</span>` : '';
-  $('pCount').innerHTML = ended ? `Slut <span class="muted">· ${n} slides</span>${goto}` : `Slide <b>${state.pIndex + 1}</b> av ${n}${goto}`;
+  const el = $('pCount');
+  const span = (cls, text) => { const x = document.createElement(cls === 'b' ? 'b' : 'span'); if (cls !== 'b') x.className = cls; x.textContent = text; return x; };
+  el.replaceChildren();
+  if (ended) el.append('Slut ', span('muted', `· ${n} slides`));
+  else el.append('Slide ', span('b', String(state.pIndex + 1)), ` av ${n}`);
+  if (state.gotoBuf) el.append(span('goto', `Gå till ${state.gotoBuf}…`));
 }
 
 function renderOverlay() {
@@ -596,10 +934,13 @@ $('pReset').addEventListener('click', () => timer.reset());
 
 function isTyping() {
   const a = document.activeElement;
-  return a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.isContentEditable);
+  if (!a) return false;
+  if (a.tagName === 'INPUT') return !/^(checkbox|radio|range|button|submit|reset|color|file)$/i.test(a.type);
+  return a.tagName === 'TEXTAREA' || a.isContentEditable;
 }
 
 function handleKey(k) {
+  if (state.imp) { if (k.key === 'Escape') closeImport(); return; }
   if (k.metaKey || k.ctrlKey) return;
   const key = k.key;
 
@@ -640,6 +981,7 @@ function handleKey(k) {
       case 'End': go(count() - 1); return;
       case 'Enter': setView('normal'); return;
       case 'Escape': setView('normal'); return;
+      case 'Backspace': case 'Delete': if (!k.fromDeck) deleteSlide(state.index); return;
       default: return;
     }
   }
@@ -649,8 +991,13 @@ function handleKey(k) {
     case 'ArrowLeft': case 'ArrowUp': case 'PageUp': go(state.index - 1); return;
     case 'Home': go(0); return;
     case 'End': go(count() - 1); return;
-    case 'Escape': if (state.edit) { if (state.selection) mainView.api.deselect(); else setEdit(false); } return;
-    case 'Backspace': case 'Delete': if (state.edit && state.selection && state.selection.kind === 'element') deleteSelected(); return;
+    case 'Escape': if (state.edit) { if (state.selection) mainView.call('deselect'); else setEdit(false); } return;
+    case 'Backspace': case 'Delete':
+      if (state.edit && state.selection && state.selection.kind === 'element') deleteSelected();
+      // Bara när du senast klickade i sidopanelen, och aldrig för en tangent som
+      // kom inifrån sliden (där kan du skriva i decket).
+      else if (state.lastPane === 'sidebar' && !k.fromDeck) deleteSlide(state.index);
+      return;
     default: return;
   }
 }
@@ -665,19 +1012,27 @@ function gridCols() {
 }
 
 document.addEventListener('keydown', (e) => {
+  if (state.imp && e.key === 'Escape') { closeImport(); return; }
   if (isTyping()) return;
   const nav = ['ArrowRight', 'ArrowLeft', 'ArrowUp', 'ArrowDown', ' ', 'PageUp', 'PageDown', 'Home', 'End'];
+  const inForm = e.target && (e.target.tagName === 'SELECT' || (e.target.closest && e.target.closest('#importDlg')));
+  if (inForm) return;
   if (nav.includes(e.key) && !e.metaKey) e.preventDefault();
   if (e.target && e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
   handleKey({ key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey });
 });
 
-mainView.on('key', (k) => handleKey(k));
+mainView.on('key', (k) => { if (k && typeof k.key === 'string') handleKey({ ...k, fromDeck: true }); });
+
+// Klick i sliden når inte appens dokument (den ligger i en iframe), men fönstret
+// tappar fokus till iframen. Då räknas sliden som senast klickad.
+window.addEventListener('blur', () => { if (document.activeElement === mainView.iframe) state.lastPane = 'stage'; });
 hp.onRemoteKey((k) => handleKey(k));
 
 /* ================================================================== menu */
 
 hp.onMenu((a) => {
+  if (state.imp && !['save', 'save-as', 'close', 'toggle-notes'].includes(a)) return;
   switch (a) {
     case 'save': save(false); break;
     case 'save-as': save(true); break;
@@ -692,14 +1047,20 @@ hp.onMenu((a) => {
     case 'present-start': if (!state.presenting) startPresenting({ from: 0 }); break;
     case 'present-current': if (!state.presenting) startPresenting({ from: state.index }); break;
     case 'present-rehearse': if (!state.presenting) startPresenting({ from: state.index, rehearse: true }); break;
+    case 'slide-duplicate': if (!state.presenting) duplicateSlide(state.index); break;
+    case 'slide-delete': if (!state.presenting) deleteSlide(state.index); break;
+    case 'slide-up': if (!state.presenting) moveSlide(state.index, state.index - 1); break;
+    case 'slide-down': if (!state.presenting) moveSlide(state.index, state.index + 2); break;
+    case 'slide-first': if (!state.presenting) moveSlide(state.index, 0); break;
+    case 'slide-last': if (!state.presenting) moveSlide(state.index, count()); break;
+    case 'import': if (!state.presenting) openImport(); break;
     default: break;
   }
 });
 
 async function reloadFromDisk() {
   if (!state.deck) return;
-  if (state.deck.dirty && !confirm('Läsa in filen från disk igen? Osparade ändringar försvinner.')) return;
-  await hp.openPath(state.deck.path);
+  await hp.reloadDeck();
 }
 
 /* ================================================================== boot */

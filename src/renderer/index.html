@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>HTML Presenter</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self' hpres:; img-src 'self' hpres: data: blob:; style-src 'self' 'unsafe-inline'; frame-src hpres: about:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; img-src 'self' hpres: data: blob:; style-src 'self' 'unsafe-inline'; frame-src hpres: about:;">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -41,6 +41,7 @@
       <div class="doc" title="">
         <span id="docName" class="doc-name"></span>
         <span id="dirtyMark" class="dirty" hidden>Ändrad</span>
+        <span id="readOnlyMark" class="dirty readonly" hidden title="Filen är inte sparad som UTF-8. Spara om den som UTF-8 för att kunna redigera.">Skrivskyddad</span>
       </div>
     </div>
 
@@ -64,7 +65,10 @@
 
   <div class="ws-body">
     <aside id="sidebar" class="sidebar">
-      <ol id="thumbList" class="thumb-list"></ol>
+      <ol id="thumbList" class="thumb-list" title="Dra en slide för att ändra ordningen"></ol>
+      <div class="sidebar-foot">
+        <button id="importBtn" class="btn small" title="Infoga slides från en annan presentation (⇧⌘I)">＋ Infoga från annan presentation…</button>
+      </div>
     </aside>
 
     <main id="normalView" class="normal">
@@ -160,6 +164,32 @@
   </div>
   <div id="pBanner" class="p-banner" hidden></div>
 </section>
+
+<!-- ====================== SLIDES FRÅN EN ANNAN PRESENTATION ====================== -->
+<div id="importDlg" class="modal" hidden>
+  <div class="modal-box" role="dialog" aria-labelledby="impTitle">
+    <header class="modal-head">
+      <h2 id="impTitle">Infoga slides från <span id="impName"></span></h2>
+      <button id="impAll" class="btn small">Markera alla</button>
+      <button id="impClose" class="icon-btn" title="Stäng (Esc)">✕</button>
+    </header>
+    <p class="modal-hint muted">Klicka på de slides du vill ha. Shift-klick väljer ett intervall.</p>
+    <ol id="impGrid" class="grid-list imp-grid"></ol>
+    <footer class="modal-foot">
+      <div class="imp-opts">
+        <label>Placera <select id="impWhere"><option value="after">efter aktuell slide</option><option value="start">först</option><option value="end">sist</option></select></label>
+        <label class="chk"><input type="checkbox" id="impStyles"> Behåll originalets utseende</label>
+        <label class="chk"><input type="checkbox" id="impMove"> Flytta — ta bort ur <span id="impMoveName"></span></label>
+        <p id="impStylesHint" class="muted small"></p>
+        <p id="impFolderHint" class="muted small">Bilder och filer som slidesen använder kopieras till den här presentationens mapp.</p>
+      </div>
+      <div class="imp-actions">
+        <button id="impCancel" class="btn">Avbryt</button>
+        <button id="impGo" class="btn primary" disabled>Välj slides</button>
+      </div>
+    </footer>
+  </div>
+</div>
 
 <div id="toast" class="toast" hidden></div>
 <script type="module" src="app.js"></script>
