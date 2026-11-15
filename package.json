@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "description": "Desktop app for HTML presentations: presenter view on two screens, slide grid and in-place text editing.",
   "author": "Peter Kurzwelly",
+  "license": "MIT",
   "homepage": "https://github.com/peterkurzwelly/html-power-presenter",
   "repository": {
     "type": "git",

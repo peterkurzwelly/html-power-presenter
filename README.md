@@ -204,3 +204,7 @@ Set `HP_EXEC` to the path of a built app's binary to test the packaged app inste
 ## Status
 
 Early version, built for my own talks and tested on macOS (Apple Silicon) with about a dozen real decks. The two-screen presenter view has mostly been tested with `npm run dual`, which fakes the second screen.
+
+## License
+
+[MIT](LICENSE) © 2026 Peter Kurzwelly
