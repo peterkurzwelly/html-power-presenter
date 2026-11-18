@@ -493,6 +493,61 @@ export class DeckStore {
     return this._commit(next, true);
   }
 
+  // Ger slides ett fast id (data-slide-id="…") i källfilen, så att en slide kan kännas
+  // igen även när ett AI-verktyg skriver om filen. Slides som redan har ett behåller det.
+  setSlideIds(ids, values) {
+    this._writable();
+    if (!Array.isArray(ids) || !Array.isArray(values) || ids.length !== values.length || !ids.length) throw new Error('Ogiltiga id.');
+    const found = findByIds(this.inst, ids);
+    const taken = new Set([...this.inst.matchAll(/\sdata-slide-id\s*=\s*["']?([^"'\s>]*)/gi)].map((m) => m[1]));
+    const inserts = [];
+    const done = new Set(); // klonade slides kan dela samma element i källan
+    ids.forEach((id, i) => {
+      if (done.has(String(id))) return;
+      done.add(String(id));
+      const node = found.get(String(id));
+      if (!node || !node.sourceCodeLocation || !node.sourceCodeLocation.startTag) throw new Error('Hittade inte sliden i källfilen.');
+      if (hasAttr(node, 'data-slide-id')) return;
+      let v = values[i];
+      if (typeof v !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(v)) throw new Error(`Ogiltigt id: ${String(v).slice(0, 80)}`);
+      // Finns id:t redan någonstans i filen (t.ex. i ett kodexempel) får det ett nummer efter.
+      if (taken.has(v)) { const base = v.slice(0, 58); let n = 2; while (taken.has(`${base}-${n}`)) n++; v = `${base}-${n}`; }
+      taken.add(v);
+      const token = ` ${ID_ATTR}="${id}"`;
+      const st = node.sourceCodeLocation.startTag;
+      const at = this.inst.indexOf(token, st.startOffset);
+      if (at < 0 || at + token.length > st.endOffset) throw new Error('Slidens starttagg kunde inte läsas säkert.');
+      inserts.push({ at: at + token.length, text: ` data-slide-id="${v}"` });
+    });
+    if (!inserts.length) return false;
+    inserts.sort((a, b) => b.at - a.at);
+    let next = this.inst;
+    for (const ins of inserts) next = next.slice(0, ins.at) + ins.text + next.slice(ins.at);
+    return this._commit(next, true);
+  }
+
+  // Källtexten för en slide (utan appens märkning), med HTML-kommentaren precis före.
+  // Kräver inte att slidesen ligger i samma behållare, till skillnad från slideChunks.
+  slideSource(id) {
+    const loc = locate(this.inst, id);
+    if (!loc) throw new Error('Hittade inte sliden i källfilen.');
+    let start = loc.start;
+    const before = this.inst.slice(Math.max(0, start - 2000), start);
+    const m = /<!--(?:(?!-->)[\s\S])*-->\s*$/.exec(before);
+    if (m) start -= before.length - m.index;
+    return strip(this.inst.slice(start, loc.end));
+  }
+
+  // Raden (från 1) där elementet börjar. Märkningen lägger inte till några radbrytningar,
+  // så raden stämmer med filen på disk så länge inget är osparat.
+  lineOf(id) {
+    const loc = locate(this.inst, id);
+    if (!loc) return null;
+    let line = 1;
+    for (let i = this.inst.indexOf('\n'); i !== -1 && i < loc.start; i = this.inst.indexOf('\n', i + 1)) line++;
+    return line;
+  }
+
   undo() {
     if (!this.undoStack.length) return false;
     this.redoStack.push(this.inst);

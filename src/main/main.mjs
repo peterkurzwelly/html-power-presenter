@@ -6,15 +6,19 @@
 
 import {
   app, BrowserWindow, protocol, ipcMain, dialog, Menu, screen,
-  powerSaveBlocker, shell,
+  powerSaveBlocker, shell, session, clipboard, net,
 } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { DeckStore, extractSlides, planRemoveSlidesFromFile, applyRemovePlan, readText } from './deckstore.mjs';
+import { DeckStore, planRemoveSlidesFromFile, applyRemovePlan, readText, backupFile, extractSlides } from './deckstore.mjs';
 import { ThumbRenderer } from './thumbs.mjs';
 import { adaptChunk, classCoverage, deckCssText, makeUrlRewriter } from './importer.mjs';
+import { Versions } from './versions.mjs';
+import { FontCache, rewriteFontLinks, rewriteCssFiles, rewriteCssImports, fontFilesIn } from './fontcache.mjs';
+import { slideForClaude, deckForClaude } from './forclaude.mjs';
+import { installPermissionPolicy, setOfflineTest } from './policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHEME = 'hpres';
@@ -24,7 +28,8 @@ const SOURCE_ORIGIN = `${SCHEME}://source`; // decket du hämtar slides från
 const UI_DIR = path.join(__dirname, '..', 'renderer');
 const PRELOAD = path.join(__dirname, 'preload.cjs');
 const CONTROLLER_URL = `${ORIGIN}/ui/controller.js`;
-const FAKE_DUAL = process.env.HP_FAKE_DUAL === '1';
+const FAKE_DUAL = process.env.HP_FAKE_DUAL === '1'; // tester: fönsterläge som standard
+const DEVTOOLS = !app.isPackaged || process.env.HP_DEVTOOLS === '1';
 
 protocol.registerSchemesAsPrivileged([{
   scheme: SCHEME,
@@ -36,7 +41,7 @@ if (process.env.HP_USER_DATA) app.setPath('userData', process.env.HP_USER_DATA);
 
 let mainWin = null;
 let audienceWin = null;
-let presenting = null; // { rehearse, swapped, blocker, restore }
+let presenting = null; // { rehearse, windowed, size, presenterId, audienceId, blocker, restore, pendingFile }
 let lastSync = null;
 let pendingOpen = null;
 let watcher = null;
@@ -46,6 +51,37 @@ const BACKUP_DIR = path.join(app.getPath('userData'), 'Säkerhetskopior');
 const deck = new DeckStore({ backupDir: BACKUP_DIR });
 const thumbs = new ThumbRenderer((t) => send(mainWin, 'thumb', t));
 let importer = null; // { store, thumbs, path, text, token, info }
+const versions = new Versions(path.join(app.getPath('userData'), 'Versioner'));
+const fontCache = new FontCache(path.join(app.getPath('userData'), 'Typsnitt'), (url, opts) => net.fetch(url, opts), { onChange: () => schedulePush() });
+// Typsnitt: vilka CSS-adresser decken länkar till (får hämtas), vilka det öppna decket
+// faktiskt har bett om (visas i statusraden) och vilka typsnittsfiler CSS:erna pekar på.
+const fontUse = { deck: new Set(), source: new Set(), requested: new Set(), files: new Set() };
+let testOffline = false;
+
+/* ------------------------------------------------------------------- prefs */
+
+// Små inställningar som gäller mellan körningar: fönsterläge och talens mållängd.
+const PREFS_FILE = () => path.join(app.getPath('userData'), 'installningar.json');
+let prefs = null;
+function getPrefs() {
+  if (prefs) return prefs;
+  try { prefs = JSON.parse(fs.readFileSync(PREFS_FILE(), 'utf8')); } catch { prefs = {}; }
+  if (!prefs || typeof prefs !== 'object') prefs = {};
+  if (!prefs.talks || typeof prefs.talks !== 'object') prefs.talks = {};
+  return prefs;
+}
+function savePrefs() {
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(PREFS_FILE(), JSON.stringify(getPrefs(), null, 1));
+  } catch (err) { console.error('prefs', err); }
+}
+const windowedPref = () => (typeof getPrefs().windowed === 'boolean' ? getPrefs().windowed : FAKE_DUAL);
+
+// En kopia av varje version av filen som appen ser (öppnad, sparad, ändrad utanför).
+function snap(reason) {
+  if (deck.path) versions.snapshot(deck.path, reason).catch((err) => console.error('version', err.message));
+}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -70,8 +106,20 @@ function deckUrl(mode) {
 }
 
 function publicState(extra = {}) {
-  if (!deck.path) return { open: false, ...extra };
-  return { open: true, ...deck.state(), baseUrl: deckBaseUrl(deck.path), ...extra };
+  const common = { windowed: windowedPref(), testOffline };
+  if (!deck.path) return { open: false, ...common, ...extra };
+  return {
+    open: true, ...deck.state(), baseUrl: deckBaseUrl(deck.path),
+    fonts: fontCache.status([...fontUse.requested]),
+    pendingFile: !!(presenting && presenting.pendingFile),
+    ...common, ...extra,
+  };
+}
+
+let pushTimer = null;
+function schedulePush() {
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { if (deck.path) pushState(); }, 400);
 }
 
 function pushState(extra) {
@@ -135,11 +183,16 @@ function isInside(file, dir) {
 
 // Ett decks skript får bara läsa filer i deckets egen mapp (och undermappar).
 // Symlänkar löses upp först, så en länk i mappen kan inte peka ut på disken.
-function serveDeckFile(store, u, p, req) {
+function serveDeckFile(store, u, p, req, origin, used) {
   if (!store || !store.path || !p.startsWith('/fs/')) return new Response('Hittades inte', { status: 404 });
   const abs = path.normalize(p.slice(3));
   if (u.searchParams.has('hp') && abs === store.path) {
-    return new Response(store.servedHtml(CONTROLLER_URL), {
+    // Google Fonts-länkar går via appen så att typsnitten finns även utan nät (filen ändras inte).
+    const { html, urls } = rewriteFontLinks(store.servedHtml(CONTROLLER_URL), origin);
+    const before = used.size;
+    urls.forEach((x) => used.add(x));
+    if (used.size !== before) schedulePush();
+    return new Response(html, {
       headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
     });
   }
@@ -147,7 +200,43 @@ function serveDeckFile(store, u, p, req) {
   try { root = fs.realpathSync(path.dirname(store.path)); } catch { return new Response('Nej', { status: 403 }); }
   try { real = fs.realpathSync(abs); } catch { return new Response('Hittades inte', { status: 404 }); }
   if (!isInside(real, root)) return new Response('Utanför deckets mapp', { status: 403 });
+  if (/\.css$/i.test(real)) {
+    try {
+      const css = fs.readFileSync(real, 'utf8');
+      const found = [];
+      const out = rewriteCssImports(css, origin, found);
+      if (found.length) {
+        found.forEach((x) => used.add(x));
+        return new Response(out, { headers: { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'no-cache' } });
+      }
+    } catch (_) { /* skickas som vanlig fil */ }
+  }
   return serveFile(real, req);
+}
+
+// hpres://deck/__fonts/css?u=… och …/file?u=…: Google Fonts från den sparade kopian
+// eller nätet. Bara typsnitt som decket självt länkar till hämtas.
+async function serveFont(u, origin, used) {
+  const kind = u.pathname.slice('/__fonts/'.length);
+  const url = u.searchParams.get('u') || '';
+  try {
+    if (kind === 'css' && used.has(url)) {
+      if (used === fontUse.deck) fontUse.requested.add(url);
+      const got = await fontCache.css(url);
+      const css = got.body.toString('utf8');
+      fontFilesIn(css).forEach((f) => fontUse.files.add(f));
+      schedulePush();
+      return new Response(rewriteCssFiles(css, origin), { headers: { 'content-type': 'text/css; charset=utf-8', 'cache-control': 'no-cache' } });
+    }
+    if (kind === 'file' && fontUse.files.has(url)) {
+      const got = await fontCache.file(url);
+      return new Response(got.body, { headers: { 'content-type': got.type || 'font/woff2', 'cache-control': 'no-cache' } });
+    }
+  } catch (_) {
+    schedulePush(); // statusraden visar att typsnittet saknas
+    return new Response('Typsnittet kunde inte hämtas', { status: 504 });
+  }
+  return new Response('Hittades inte', { status: 404 });
 }
 
 function handleProtocol(req) {
@@ -159,8 +248,8 @@ function handleProtocol(req) {
     if (!isInside(file, UI_DIR)) return new Response('Nej', { status: 403 });
     return serveFile(file, req);
   }
-  if (u.host === 'deck') return serveDeckFile(deck, u, p, req);
-  if (u.host === 'source') return serveDeckFile(importer && importer.store, u, p, req);
+  if (u.host === 'deck') return p.startsWith('/__fonts/') ? serveFont(u, DECK_ORIGIN, fontUse.deck) : serveDeckFile(deck, u, p, req, DECK_ORIGIN, fontUse.deck);
+  if (u.host === 'source') return p.startsWith('/__fonts/') ? serveFont(u, SOURCE_ORIGIN, fontUse.source) : serveDeckFile(importer && importer.store, u, p, req, SOURCE_ORIGIN, fontUse.source);
   return new Response('Okänd värd', { status: 404 });
 }
 
@@ -268,10 +357,13 @@ async function openDeck(p) {
     return null;
   }
   setHpsel(null);
+  fontUse.deck.clear();
+  fontUse.requested.clear();
   const entry = touchRecent(p);
   watchFile(p);
   closeImporter();
   thumbs.cancel();
+  snap('open');
   return pushState({ reload: true, lastIndex: entry.lastIndex || 0 });
 }
 
@@ -279,11 +371,15 @@ async function reloadDeck() {
   if (!deck.path) return null;
   if (!(await confirmDiscard())) return null;
   try { deck.load(deck.path); } catch (err) { dialog.showErrorBox('Kunde inte läsa filen', err.message); return null; }
+  if (presenting) presenting.pendingFile = false;
+  snap('reload');
   return pushState({ reload: true });
 }
 
 function closeDeck() {
   setHpsel(null);
+  fontUse.deck.clear();
+  fontUse.requested.clear();
   unwatch();
   closeImporter();
   thumbs.cancel();
@@ -291,11 +387,31 @@ function closeDeck() {
   pushState({ reload: true });
 }
 
+// Har filen ändrats på disk sedan appen läste den (t.ex. av ett AI-verktyg under ett
+// bildspel)? Då sparas den versionen först, och du får välja innan den skrivs över.
+async function confirmOverwriteExternal() {
+  let disk;
+  try { disk = readText(deck.path).text; } catch { return true; }
+  if (disk === deck.diskText) return true;
+  await versions.snapshot(deck.path, 'extern').catch(() => null);
+  const { response } = await dialog.showMessageBox(mainWin, {
+    type: 'warning',
+    message: `”${deck.name}” har ändrats utanför appen sedan den lästes in.`,
+    detail: 'Sparar du nu skrivs den nya versionen över med appens version. Den nya versionen finns kvar under Arkiv → Tidigare versioner.',
+    buttons: ['Spara ändå', 'Avbryt'],
+    defaultId: 1, cancelId: 1,
+  });
+  return response === 0;
+}
+
 async function doSave() {
   if (!deck.path) return false;
+  if (!(await confirmOverwriteExternal())) return false;
   try {
     selfWrite = Date.now();
     deck.save();
+    if (presenting) presenting.pendingFile = false;
+    snap('save');
     pushState();
     return true;
   } catch (err) {
@@ -316,6 +432,7 @@ async function doSaveAs() {
     deck.save(filePath);
     touchRecent(deck.path);
     watchFile(deck.path);
+    snap('save');
     pushState();
     return true;
   } catch (err) {
@@ -356,27 +473,76 @@ function watchFile(p) {
   } catch (err) { console.error('watch', err); }
 }
 
-async function onFileChanged(p) {
+// Ett verktyg kan fortfarande hålla på att skriva filen: läs tills den ligger still.
+async function readStable(p) {
+  const read = () => { try { return readText(p).text; } catch { return null; } };
+  let a = read();
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 300));
+    const b = read();
+    if (b === a) return b;
+    a = b;
+  }
+  return a;
+}
+
+// Under ett bildspel laddas ingenting om mitt i en mening: den nya versionen väntar
+// tills bildspelet är slut, eller tills du själv väljer att läsa in den.
+function holdFile() {
+  if (presenting.pendingFile) return;
+  presenting.pendingFile = true;
+  send(mainWin, 'file-pending', { name: deck.name });
+  pushState();
+}
+
+let fileCheck = null; // { again, force } medan en kontroll pågår
+async function onFileChanged(p, { force = false } = {}) {
+  if (fileCheck) { fileCheck.again = true; fileCheck.force = fileCheck.force || force; return; }
+  fileCheck = { again: false, force: false };
+  try { await checkFile(p, force); }
+  finally {
+    const again = fileCheck.again && deck.path;
+    const againForce = fileCheck.force;
+    fileCheck = null;
+    if (again) setTimeout(() => onFileChanged(deck.path, { force: againForce }), 50);
+  }
+}
+
+async function checkFile(p, force) {
   if (p !== deck.path || !fs.existsSync(p)) return;
   if (Date.now() - selfWrite < 1500) return;
-  const read = () => { try { return readText(p).text; } catch { return null; } };
-  if (read() === deck.diskText) return;
+  const quick = (() => { try { return readText(p).text; } catch { return null; } })();
+  if (quick == null || quick === deck.diskText) return;
+  const text = await readStable(p);
+  if (p !== deck.path || text == null || text === deck.diskText) return;
+  // Varje version som ett annat verktyg skriver sparas, även om den inte läses in nu.
+  await versions.snapshot(p, 'extern').catch((err) => console.error('version', err.message));
+  const locked = () => !!presenting && !force;
+  if (locked()) { holdFile(); return; }
   // En text du håller på att skriva räknas som en osparad ändring.
   await flushRenderer();
   if (p !== deck.path) return;
-  const text = read();
-  if (text == null || text === deck.diskText) return;
+  if (locked()) { holdFile(); return; }
   if (deck.dirty) {
     const { response } = await dialog.showMessageBox(mainWin, {
       type: 'question',
       message: `”${deck.name}” har ändrats utanför appen.`,
-      detail: 'Vill du läsa in den nya versionen? Dina osparade ändringar i appen försvinner då.',
+      detail: 'Vill du läsa in den nya versionen? Dina osparade ändringar i appen försvinner då. Den nya versionen finns kvar under Arkiv → Tidigare versioner om du behåller dina ändringar.',
       buttons: ['Behåll mina ändringar', 'Läs in nya versionen'],
       defaultId: 0, cancelId: 0,
     });
-    if (response !== 1) { deck.diskText = text; return; }
+    if (p !== deck.path) return;
+    if (response !== 1) {
+      deck.diskText = text;
+      if (presenting) presenting.pendingFile = false;
+      pushState();
+      return;
+    }
   }
+  if (locked()) { holdFile(); return; }
   deck.load(p);
+  if (presenting) presenting.pendingFile = false;
+  snap('extern');
   pushState({ reload: true, external: true });
   if (presenting) syncAudience(lastSync);
 }
@@ -404,19 +570,37 @@ function swapDisplays() {
   layoutPresentation();
 }
 
-function createAudienceWindow() {
+function createAudienceWindow(framed) {
   const win = new BrowserWindow({
     show: false,
-    frame: FAKE_DUAL,
-    width: 960, height: 540,
+    frame: framed,
+    width: 960, height: 540, minWidth: 320, minHeight: 180,
     backgroundColor: '#000000',
-    title: 'Publik',
+    title: `Publik – ${deck.name}`,
     webPreferences: { preload: PRELOAD, spellcheck: false, backgroundThrottling: false },
   });
+  const size = presenting && presenting.size;
+  if (framed && size) win.setAspectRatio(size.w / size.h);
+  // Behåll fönstertiteln (sidans <title> är bara "Publik"), så att fönstret går att
+  // känna igen när du väljer vad du ska dela i Teams eller Zoom.
+  win.on('page-title-updated', (e) => e.preventDefault());
   guardWindow(win, `${ORIGIN}/ui/`);
   win.loadURL(`${ORIGIN}/ui/audience.html`);
+  // I fönsterläge har publikfönstret en stängknapp: fråga innan bildspelet avslutas.
+  win.on('close', (e) => {
+    if (!framed || !presenting || quitting || audienceWin !== win) return;
+    e.preventDefault();
+    dialog.showMessageBox(mainWin, {
+      type: 'question',
+      message: 'Avsluta bildspelet?',
+      detail: 'Publikfönstret stängs och du kommer tillbaka till redigeringsvyn.',
+      buttons: ['Avsluta bildspelet', 'Fortsätt presentera'],
+      defaultId: 1, cancelId: 1,
+    }).then(({ response }) => { if (response === 0) stopPresenting(); });
+  });
   win.on('closed', () => {
-    if (audienceWin === win) audienceWin = null;
+    if (audienceWin !== win) return; // ersatt av ett nytt fönster, eller bildspelet är slut
+    audienceWin = null;
     if (presenting && !presenting.rehearse && !quitting) stopPresenting();
   });
   return win;
@@ -434,39 +618,125 @@ function placeWindow(win, display, full) {
   }
 }
 
-function layoutPresentation() {
+// Fönsterläge: presentatörsvyn och publiken som vanliga fönster. Med en skärm ligger de
+// sida vid sida (presentatörsvyn till vänster), med två skärmar på var sin.
+function placeWindowed(dual, presenterDisplay, audienceDisplay) {
+  const ratio = presenting.size ? presenting.size.w / presenting.size.h : 16 / 9;
+  if (mainWin.isSimpleFullScreen()) mainWin.setSimpleFullScreen(false);
+  if (mainWin.isMaximized()) mainWin.unmaximize();
+  mainWin.setMinimumSize(640, 420);
+  if (!audienceWin) { mainWin.setBounds(presenterDisplay.workArea); return; } // övning
+  if (audienceWin.isSimpleFullScreen()) audienceWin.setSimpleFullScreen(false);
+  const bar = Math.max(0, audienceWin.getBounds().height - audienceWin.getContentBounds().height) || 28;
+  if (dual) {
+    const wa = audienceDisplay.workArea;
+    let w = Math.round(wa.width * 0.8);
+    let h = Math.round(w / ratio);
+    if (h + bar > wa.height * 0.9) { h = Math.round(wa.height * 0.9 - bar); w = Math.round(h * ratio); }
+    audienceWin.setContentBounds({ x: wa.x + Math.round((wa.width - w) / 2), y: wa.y + Math.round((wa.height - h - bar) / 2) + bar, width: w, height: h });
+    mainWin.setBounds(presenterDisplay.workArea);
+  } else {
+    const wa = presenterDisplay.workArea;
+    // Presentatörsvyn behöver minst 640 px; publikfönstret får resten (minst 320 px).
+    let aw = Math.max(320, Math.min(Math.round(wa.width * 0.42), wa.width - 640));
+    let ah = Math.round(aw / ratio);
+    if (ah + bar > wa.height) { ah = wa.height - bar; aw = Math.round(ah * ratio); }
+    mainWin.setBounds({ x: wa.x, y: wa.y, width: wa.width - aw, height: wa.height });
+    audienceWin.setContentBounds({ x: wa.x + wa.width - aw, y: wa.y + bar, width: aw, height: ah });
+  }
+}
+
+// place = flytta fönstren till sina platser. I fönsterläge görs det bara när
+// bildspelet startar, när läget byts och vid Byt skärmar, så att fönster du själv
+// har flyttat (t.ex. för att dela i Teams) ligger kvar när en skärm kopplas in.
+function layoutPresentation({ place = true } = {}) {
   if (!presenting || !mainWin) return;
   const { presenterDisplay, audienceDisplay, dual } = displaysFor();
   presenting.dual = dual;
+  const windowed = presenting.windowed;
+  let created = false;
   if (!presenting.rehearse) {
-    if (!audienceWin) audienceWin = createAudienceWindow();
-    placeWindow(audienceWin, audienceDisplay, !FAKE_DUAL);
-    audienceWin.show();
+    if (!audienceWin) { audienceWin = createAudienceWindow(windowed); created = true; }
+    if (!windowed) placeWindow(audienceWin, audienceDisplay, true);
   }
-  // Presentatörsvyn fyller sin skärm när det finns två skärmar (eller vid övning).
-  if (dual || presenting.rehearse || FAKE_DUAL) {
-    if (dual && !presenting.rehearse) placeWindow(mainWin, presenterDisplay, !FAKE_DUAL);
-    else if (!mainWin.isSimpleFullScreen() && !FAKE_DUAL) mainWin.setSimpleFullScreen(true);
+  if (windowed) {
+    if (place || created) placeWindowed(dual, presenterDisplay, audienceDisplay);
+    if (audienceWin && !audienceWin.isVisible()) audienceWin.showInactive();
+    mainWin.focus();
+  } else {
+    if (audienceWin && !audienceWin.isVisible()) audienceWin.show();
+    // Presentatörsvyn fyller sin skärm när det finns två skärmar (eller vid övning).
+    if (dual && !presenting.rehearse) placeWindow(mainWin, presenterDisplay, true);
+    else if (presenting.rehearse && !mainWin.isSimpleFullScreen()) mainWin.setSimpleFullScreen(true);
+    if (dual || presenting.rehearse) mainWin.focus();
+    else if (audienceWin) audienceWin.focus();
   }
-  if (dual || presenting.rehearse || FAKE_DUAL) mainWin.focus();
-  else if (audienceWin) audienceWin.focus();
-  send(mainWin, 'present-layout', { dual, rehearse: presenting.rehearse, audience: !!audienceWin, fake: FAKE_DUAL });
+  send(mainWin, 'present-layout', { dual, rehearse: presenting.rehearse, audience: !!audienceWin, windowed });
 }
 
-function startPresenting({ rehearse = false } = {}) {
+const validSize = (s) => (s && [s.w, s.h].every((x) => typeof x === 'number' && Number.isFinite(x) && x >= 50 && x <= 20000) ? { w: s.w, h: s.h } : null);
+
+const presentInfo = () => {
+  const { dual } = displaysFor();
+  return { ok: true, dual, rehearse: presenting.rehearse, audience: !!audienceWin, windowed: presenting.windowed };
+};
+
+// macOS egna helskärmsläge (gröna knappen) lägger fönstret i ett eget skrivbord. Lämna det
+// först, annars hamnar publikfönstret på ett annat skrivbord än presentatörsvyn.
+function leaveNativeFullScreen() {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, 1500);
+    mainWin.once('leave-full-screen', () => { clearTimeout(t); setTimeout(resolve, 150); });
+    mainWin.setFullScreen(false);
+  });
+}
+
+async function startPresenting({ rehearse = false, windowed, size } = {}) {
   if (!deck.path || !mainWin) return null;
-  if (presenting) { layoutPresentation(); return { ok: true }; }
+  if (presenting) { layoutPresentation(); return presentInfo(); }
+  const nativeFull = mainWin.isFullScreen();
   presenting = {
-    rehearse,
+    rehearse: !!rehearse,
+    windowed: typeof windowed === 'boolean' ? windowed : windowedPref(),
+    size: validSize(size),
     presenterId: null,
     audienceId: null,
+    pendingFile: false,
     blocker: powerSaveBlocker.start('prevent-display-sleep'),
-    restore: { bounds: mainWin.getBounds(), maximized: mainWin.isMaximized(), simple: mainWin.isSimpleFullScreen() },
+    restore: { bounds: mainWin.getBounds(), maximized: mainWin.isMaximized(), simple: mainWin.isSimpleFullScreen(), fullscreen: nativeFull },
   };
+  if (nativeFull) {
+    const p = presenting;
+    await leaveNativeFullScreen();
+    if (presenting !== p || !mainWin) return null; // avslutat under tiden
+    p.restore.bounds = mainWin.getBounds();
+  }
   layoutPresentation();
-  const { dual } = displaysFor();
   updateMenu();
-  return { ok: true, dual, rehearse, audience: !!audienceWin, fake: FAKE_DUAL };
+  return presentInfo();
+}
+
+// Byter mellan helskärm och fönsterläge, även mitt i ett bildspel.
+let windowedAt = 0;
+function setWindowed(on) {
+  on = !!on;
+  // Byte mitt i ett bildspel byter ut publikfönstret: inte oftare än en gång i sekunden.
+  if (presenting && presenting.windowed !== on) {
+    if (Date.now() - windowedAt < 1000) return;
+    windowedAt = Date.now();
+  }
+  getPrefs().windowed = on;
+  savePrefs();
+  if (presenting && presenting.windowed !== on) {
+    presenting.windowed = on;
+    // En ram kan inte läggas till eller tas bort på ett öppet fönster, så publikfönstret
+    // byts ut. Det nya hämtar sliden själv när det är redo (audience-ready).
+    if (audienceWin && !audienceWin.isDestroyed()) { const old = audienceWin; audienceWin = null; old.destroy(); }
+    if (on && mainWin && mainWin.isSimpleFullScreen()) mainWin.setSimpleFullScreen(false);
+    layoutPresentation({ place: true });
+  }
+  updateMenu();
+  pushState();
 }
 
 function stopPresenting() {
@@ -478,18 +748,144 @@ function stopPresenting() {
   if (audienceWin && !audienceWin.isDestroyed()) { const w = audienceWin; audienceWin = null; w.destroy(); }
   if (mainWin && !mainWin.isDestroyed()) {
     if (mainWin.isSimpleFullScreen() && !p.restore.simple) mainWin.setSimpleFullScreen(false);
+    mainWin.setMinimumSize(900, 600);
     mainWin.setBounds(p.restore.bounds);
     if (p.restore.maximized) mainWin.maximize();
+    if (p.restore.fullscreen) mainWin.setFullScreen(true);
     mainWin.focus();
   }
   send(mainWin, 'present-stopped', {});
   updateMenu();
+  // En ny version av filen som kom under bildspelet läses in nu.
+  if (p.pendingFile && deck.path) setTimeout(() => onFileChanged(deck.path), 200);
 }
 
 function syncAudience(state) {
   if (!state) return;
   lastSync = { ...state, url: deck.path ? deckUrl('audience') : null };
+  // Slidens proportioner kan ändras när filen läses om: publikfönstret följer med.
+  const size = validSize(state.size);
+  if (presenting && size && (!presenting.size || presenting.size.w !== size.w || presenting.size.h !== size.h)) {
+    presenting.size = size;
+    if (presenting.windowed && audienceWin && !audienceWin.isDestroyed()) audienceWin.setAspectRatio(size.w / size.h);
+  }
   send(audienceWin, 'sync', lastSync);
+}
+
+/* ------------------------------------------------------------ versioner */
+
+async function restoreVersion(id) {
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  if (presenting) return { error: 'Avsluta bildspelet först.' };
+  let buf;
+  try { buf = await versions.read(deck.path, id); } catch (err) { return { error: err.message }; }
+  if (!(await confirmDiscard())) return { cancelled: true };
+  // Den nuvarande versionen sparas först. Går det inte (t.ex. för stor fil) görs en vanlig
+  // säkerhetskopia, och går inte heller det avbryts återställningen.
+  const before = await versions.snapshot(deck.path, 'before-restore').catch((err) => ({ error: err }));
+  if (before && (before.skipped || before.error)) {
+    try { backupFile(BACKUP_DIR, deck.path); }
+    catch (err) { return { error: `Den nuvarande filen kunde inte sparas undan först, så inget återställdes: ${err.message}` }; }
+  }
+  try {
+    selfWrite = Date.now();
+    fs.writeFileSync(deck.path, buf);
+    deck.load(deck.path);
+  } catch (err) { return { error: err.message }; }
+  snap('restore');
+  pushState({ reload: true });
+  return { ok: true };
+}
+
+async function saveVersionCopy(id) {
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  let buf;
+  try { buf = await versions.read(deck.path, id); } catch (err) { return { error: err.message }; }
+  const ext = path.extname(deck.path);
+  const entry = versions.list(deck.path).find((e) => e.id === id);
+  const d = new Date(entry ? entry.at : Date.now());
+  const pad = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}.${pad(d.getMinutes())}`; // lokal tid
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWin, {
+    title: 'Spara versionen som en kopia',
+    // Samma mapp som decket, så att bilder och andra filer med relativa sökvägar fungerar.
+    defaultPath: path.join(path.dirname(deck.path), `${path.basename(deck.path, ext)} (version ${stamp})${ext}`),
+    filters: [{ name: 'HTML', extensions: ['html', 'htm'] }],
+  });
+  if (canceled || !filePath) return { cancelled: true };
+  if (path.resolve(filePath) === deck.path) return { error: 'Välj ett annat namn än den öppna filen (använd Återställ för att ersätta den).' };
+  try { fs.writeFileSync(filePath, buf); } catch (err) { return { error: err.message }; }
+  return { ok: true, path: filePath, name: path.basename(filePath) };
+}
+
+/* ------------------------------------------------------- testa utan nät */
+
+function setTestOffline(on) {
+  testOffline = !!on;
+  fontCache.offline = testOffline;
+  setOfflineTest(session.defaultSession, testOffline);
+  updateMenu();
+  // Publikfönstret laddas också om, så att det visar samma sak som presentatörsvyn.
+  if (audienceWin && !audienceWin.isDestroyed()) audienceWin.webContents.reload();
+  // Ladda om vyerna så att allt hämtas på nytt (eller misslyckas) som utan nät.
+  if (deck.path) pushState({ reload: true });
+  else pushState();
+}
+
+/* ------------------------------------------------------ text till Claude */
+
+const str = (v, max = 2000) => (typeof v === 'string' ? v.slice(0, max) : '');
+const slideIdOk = (v) => (typeof v === 'string' && /^[A-Za-z0-9][\w-]{0,63}$/.test(v) ? v : '');
+const hpIdsOk = (ids) => Array.isArray(ids) && ids.length > 0 && ids.length <= 5000 && ids.every((x) => typeof x === 'string' && /^\d{1,9}$/.test(x));
+
+function copySlide(o = {}) {
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  if (o.rev !== deck.rev) return { error: 'Vänta tills presentationen har laddats om och försök igen.', stale: true };
+  if (!hpIdsOk(o.ids) || !Number.isInteger(o.index) || o.index < 0 || o.index >= o.ids.length) return { error: 'Den här sliden kunde inte kopplas till källfilen.' };
+  try {
+    const html = deck.slideSource(o.ids[o.index]);
+    const line = deck.lineOf(o.ids[o.index]);
+    const text = slideForClaude({
+      index: o.index, count: o.ids.length, title: str(o.title, 300), slideId: slideIdOk(o.slideId),
+      file: deck.path, line, dirty: deck.dirty, size: validSize(o.size), notes: str(o.notes, 20000), html, budget: str(o.budget, 40),
+    });
+    clipboard.writeText(text);
+    return { ok: true, line, chars: text.length };
+  } catch (err) { return { error: err.message }; }
+}
+
+function copyDeck(o = {}) {
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  const slides = Array.isArray(o.slides) ? o.slides.slice(0, 5000).map((x) => ({
+    title: str(x && x.title, 300), text: str(x && x.text, 4000), notes: str(x && x.notes, 20000),
+    slideId: slideIdOk(x && x.slideId), budget: str(x && x.budget, 40),
+  })) : [];
+  if (!slides.length) return { error: 'Decket har inga slides att kopiera.' };
+  const recipe = ['plain', 'qa', 'cut', 'story'].includes(o.recipe) ? o.recipe : 'plain';
+  const targetMin = Number.isInteger(o.targetMin) && o.targetMin > 0 && o.targetMin < 600 ? o.targetMin : 20;
+  const totalMin = Number.isInteger(o.totalMin) && o.totalMin > 0 ? o.totalMin : null;
+  const text = deckForClaude({ file: deck.path, name: deck.name, size: validSize(o.size), slides, recipe, targetMin, totalMin });
+  clipboard.writeText(text);
+  return { ok: true, chars: text.length, kb: Math.max(1, Math.round(Buffer.byteLength(text) / 1024)) };
+}
+
+// Öppnar filen i en kodeditor på raden där elementet börjar (VS Code, Cursor eller Windsurf).
+async function openInEditor(id) {
+  if (!deck.path) return { error: 'Ingen presentation är öppen.' };
+  if (typeof id !== 'string' || !/^\d{1,9}$/.test(id)) return { error: 'Inget element valt.' };
+  let line = 1;
+  try { line = deck.lineOf(id) || 1; } catch (_) { /* felnästlat element: öppna på rad 1 */ }
+  const enc = deck.path.split('/').map(encodeURIComponent).join('/');
+  for (const scheme of ['vscode', 'cursor', 'windsurf']) {
+    let name = '';
+    try { name = app.getApplicationNameForProtocol(`${scheme}://`); } catch (_) {}
+    if (name) {
+      try { await shell.openExternal(`${scheme}://file${enc}:${line}`); return { ok: true, editor: name.replace(/\.app$/i, ''), line, dirty: deck.dirty }; }
+      catch (_) { /* prova nästa */ }
+    }
+  }
+  const err = await shell.openPath(deck.path);
+  return err ? { error: err } : { ok: true, editor: 'standardprogrammet', line, dirty: deck.dirty, noLine: true };
 }
 
 /* -------------------------------------------------------------------- IPC */
@@ -545,9 +941,37 @@ function wireIpc() {
     thumbs.render(deckUrl('thumb'), token, indices || null);
   });
 
-  handle('present-start', (_e, opts) => { setHpsel(opts && opts.hpsel); return startPresenting(opts); });
+  handle('present-start', (_e, opts) => { setHpsel(opts && opts.hpsel); return startPresenting(opts || {}); });
   handle('present-stop', () => stopPresenting());
   handle('present-swap', () => swapDisplays());
+  handle('present-windowed', (_e, on) => setWindowed(on));
+  handle('load-pending', async () => {
+    if (presenting && presenting.pendingFile && deck.path) await onFileChanged(deck.path, { force: true });
+    return publicState();
+  });
+  handle('test-offline', (_e, on) => setTestOffline(on));
+
+  // Talets mållängd sparas per fil.
+  handle('talk-get', () => {
+    const t = deck.path && getPrefs().talks[deck.path];
+    return { minutes: t && Number.isInteger(t.minutes) ? t.minutes : null };
+  });
+  handle('talk-set', (_e, minutes) => {
+    if (!deck.path) return null;
+    const m = Number.isInteger(minutes) && minutes > 0 && minutes <= 600 ? minutes : null;
+    if (m) getPrefs().talks[deck.path] = { minutes: m, at: Date.now() };
+    else delete getPrefs().talks[deck.path];
+    savePrefs();
+    return { minutes: m };
+  });
+
+  handle('versions-list', () => (deck.path ? versions.list(deck.path).map(({ id, at, reason, label, size }) => ({ id, at, reason, label, size })) : []));
+  handle('version-restore', (_e, id) => restoreVersion(id));
+  handle('version-save-copy', (_e, id) => saveVersionCopy(id));
+
+  handle('copy-slide', (_e, o) => copySlide(o));
+  handle('copy-deck', (_e, o) => copyDeck(o));
+  handle('open-in-editor', (_e, id) => openInEditor(id));
   on('present-sync', fromMain, (_e, state) => syncAudience(state));
   on('audience-ready', fromAudience, () => syncAudience(lastSync));
   on('audience-key', fromAudience, (_e, k) => send(mainWin, 'remote-key', k));
@@ -567,6 +991,10 @@ function wireIpc() {
   handle('slides-reorder', (_e, { ids, order, rev }) => slideOp(rev, () => deck.reorderSlides(ids, order)));
   handle('slides-remove', (_e, { ids, indices, rev }) => slideOp(rev, () => deck.removeSlides(ids, indices)));
   handle('slides-duplicate', (_e, { ids, index, rev }) => slideOp(rev, () => deck.duplicateSlide(ids, index)));
+  handle('slides-set-ids', (_e, { ids, values, rev }) => slideOp(rev, () => {
+    if (!hpIdsOk(ids)) throw new Error('Slidesen kunde inte kopplas till källfilen.');
+    if (!deck.setSlideIds(ids, values)) throw new Error('Alla slides har redan ett fast id.');
+  }));
 
   // Hämta slides från ett annat deck.
   handle('import-pick', () => importPick());
@@ -601,6 +1029,7 @@ async function importPick() {
     return null;
   }
   closeImporter();
+  fontUse.source.clear();
   const store = new DeckStore({ backupDir: BACKUP_DIR });
   try { store.load(p); } catch (err) { dialog.showErrorBox('Kunde inte öppna filen', `${p}\n\n${err.message}`); return null; }
   const token = `imp-${Date.now()}`;
@@ -658,13 +1087,15 @@ async function importRun({ token, indices, after, move, keepStyles, target, rev 
       rewrite,
     }));
     const at = Number.isInteger(after) ? Math.max(-1, Math.min(target.ids.length - 1, after)) : target.ids.length - 1;
-    deck.insertSlides(target.ids, at, chunks, list.map((i) => imp.info.notes[i] || ''));
+    if (move && readText(deck.path).text !== deck.diskText) throw new Error(`”${deck.name}” har ändrats utanför appen. Läs in den igen (⌘R) och försök sedan.`);
+    deck.insertSlides(target.ids, at, chunks.map(unproxyFonts), list.map((i) => imp.info.notes[i] || ''));
     inserted = true;
     let moved = false;
     if (move) {
       // Spara först det här decket, ta sedan bort slidesen ur det andra.
       selfWrite = Date.now();
       deck.save();
+      snap('save');
       try {
         applyRemovePlan(plan, BACKUP_DIR);
       } catch (err) {
@@ -682,6 +1113,14 @@ async function importRun({ token, indices, after, move, keepStyles, target, rev 
   } finally {
     if (inserted) { closeImporter(); pushState({ reload: true }); }
   }
+}
+
+// Typsnitt som visades via appen (hpres://…/__fonts/…?u=…) skrivs tillbaka som de riktiga
+// Google Fonts-adresserna innan något hamnar i en fil.
+function unproxyFonts(html) {
+  return String(html).replace(/hpres:\/\/(?:deck|source)\/__fonts\/(?:css|file)\?u=([^"')\s&<>]+)/g, (m, u) => {
+    try { const d = decodeURIComponent(u); return /^https:\/\/fonts\.(?:googleapis|gstatic)\.com\//.test(d) ? d : m; } catch { return m; }
+  });
 }
 
 /* ------------------------------------------------------------------- menu */
@@ -705,6 +1144,7 @@ function updateMenu() {
         { label: 'Spara som…', accelerator: 'Shift+CmdOrCtrl+S', enabled: open, click: menuAction('save-as') },
         { label: 'Läs in filen igen', accelerator: 'CmdOrCtrl+R', enabled: open, click: menuAction('reload') },
         { label: 'Visa i Finder', enabled: open, click: () => shell.showItemInFolder(deck.path) },
+        { label: 'Tidigare versioner…', enabled: open, click: menuAction('versions') },
         { type: 'separator' },
         { label: 'Stäng presentation', accelerator: 'CmdOrCtrl+W', enabled: open, click: menuAction('close') },
       ],
@@ -732,7 +1172,8 @@ function updateMenu() {
         { label: 'Visa/dölj anteckningar', accelerator: 'CmdOrCtrl+Alt+N', enabled: open, click: menuAction('toggle-notes') },
         { type: 'separator' },
         { role: 'togglefullscreen', label: 'Helskärm' },
-        { role: 'toggleDevTools', label: 'Utvecklarverktyg' },
+        // Utvecklarverktyg bara när appen körs från källkoden (eller med HP_DEVTOOLS=1).
+        ...(DEVTOOLS ? [{ role: 'toggleDevTools', label: 'Utvecklarverktyg' }] : []),
       ],
     },
     {
@@ -747,6 +1188,20 @@ function updateMenu() {
         { label: 'Flytta slide sist', accelerator: 'Shift+Alt+CmdOrCtrl+Down', enabled: open, click: menuAction('slide-last') },
         { type: 'separator' },
         { label: 'Infoga slides från annan presentation…', accelerator: 'Shift+CmdOrCtrl+I', enabled: open, click: menuAction('import') },
+        { type: 'separator' },
+        { label: 'Kopiera slide för Claude', accelerator: 'Alt+CmdOrCtrl+C', enabled: open, click: menuAction('copy-slide') },
+        {
+          label: 'Kopiera decket för Claude',
+          enabled: open,
+          submenu: [
+            { label: 'Som text', accelerator: 'Shift+Alt+CmdOrCtrl+C', click: menuAction('copy-deck:plain') },
+            { label: 'Med fråga: förbered frågor och svar', click: menuAction('copy-deck:qa') },
+            { label: 'Med fråga: korta till målets längd', click: menuAction('copy-deck:cut') },
+            { label: 'Med fråga: granska berättelsen', click: menuAction('copy-deck:story') },
+          ],
+        },
+        { label: 'Visa i kodeditor', accelerator: 'Alt+CmdOrCtrl+O', enabled: open, click: menuAction('open-editor') },
+        { label: 'Ge slides fasta id', enabled: open, click: menuAction('slide-ids') },
       ],
     },
     {
@@ -757,6 +1212,9 @@ function updateMenu() {
         { label: 'Öva med presentatörsvy', accelerator: 'Alt+CmdOrCtrl+Enter', enabled: open, click: menuAction('present-rehearse') },
         { type: 'separator' },
         { label: 'Byt skärmar', enabled: !!presenting, click: () => swapDisplays() },
+        { type: 'separator' },
+        { label: 'Fönsterläge – presentatörsvy och publik i egna fönster', type: 'checkbox', checked: presenting ? presenting.windowed : windowedPref(), click: (item) => setWindowed(item.checked) },
+        { label: 'Testa utan nät', type: 'checkbox', checked: testOffline, click: (item) => setTestOffline(item.checked) },
       ],
     },
     { role: 'windowMenu', label: 'Fönster' },
@@ -784,7 +1242,11 @@ function createMainWindow() {
     if (closeConfirmed || !deck.path) return;
     e.preventDefault();
     if (await confirmDiscard()) { closeConfirmed = true; mainWin.close(); }
-    else quitting = false;
+    else {
+      quitting = false;
+      // Avbröts en avslutning mitt i ett bildspel hann publikfönstret stängas: öppna det igen.
+      if (presenting && !presenting.rehearse && !audienceWin) layoutPresentation();
+    }
   });
   mainWin.on('closed', () => {
     mainWin = null;
@@ -819,13 +1281,15 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     protocol.handle(SCHEME, handleProtocol);
+    installPermissionPolicy(session.defaultSession);
     wireIpc();
     updateMenu();
     const f = fileFromArgv(process.argv);
     if (f) pendingOpen = path.resolve(f);
     createMainWindow();
 
-    const relayout = () => { if (presenting) layoutPresentation(); };
+    // I fönsterläge ligger fönstren kvar där du har lagt dem när en skärm kopplas in eller ur.
+    const relayout = () => { if (presenting) layoutPresentation({ place: !presenting.windowed }); };
     screen.on('display-added', relayout);
     screen.on('display-removed', relayout);
   });

@@ -72,6 +72,7 @@
     execUndo: (redo) => hp.execUndo(redo),
     cancelEdit: (id) => hp.cancelEdit(id),
     info: () => hp.info(),
+    outline: () => hp.outline(),
   };
 
   window.addEventListener('message', (e) => {
@@ -327,7 +328,7 @@
   }
 
   function titleOf(el, i) {
-    const attr = el.getAttribute('aria-label') || el.getAttribute('data-screen-label') || el.getAttribute('data-title') || el.getAttribute('title');
+    const attr = el.getAttribute('aria-label') || el.getAttribute('data-label') || el.getAttribute('data-screen-label') || el.getAttribute('data-title') || el.getAttribute('title');
     if (attr) return attr.trim();
     const h = el.querySelector('h1, h2, h3, header, .title');
     const t = h ? (h.textContent || '').replace(/\s+/g, ' ').trim() : '';
@@ -483,7 +484,20 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
       slideTag: hp.whole ? '' : mostCommon(hp.slides.map((s) => s.tagName.toLowerCase())),
       commonClasses: hp.whole ? [] : commonClasses(hp.slides),
       jsonNotes: !!fromJson,
+      // Fasta id:n (data-slide-id) som decket självt ger sina slides.
+      slideIds: hp.whole ? [] : hp.slides.map((s) => s.getAttribute('data-slide-id') || ''),
     };
+  };
+
+  // Den synliga texten på varje slide, utan anteckningar, skript och appens egna delar.
+  // Används när hela decket kopieras som text till Claude.
+  hp.outline = function () {
+    if (hp.whole) return [];
+    return hp.slides.map((s) => {
+      const c = s.cloneNode(true);
+      c.querySelectorAll('script, style, template, noscript, ' + NOTE_SELECTOR + ', [data-hp-ui]').forEach((x) => x.remove());
+      return textBlock(c).slice(0, 4000);
+    });
   };
 
   function mostCommon(list) {
@@ -524,17 +538,36 @@ html.hp-edit [data-hp-cur] *, html.hp-edit [data-hp-cur] *::before, html.hp-edit
 
   function ancestorsOf(el) { const a = []; for (let p = el.parentElement; p; p = p.parentElement) a.push(p); return a; }
 
+  // Appen hämtar Google Fonts via en egen adress (för att kunna visa dem utan nät).
+  // När stilar följer med en slide till ett annat deck ska den riktiga adressen med.
+  function unproxyFont(href) {
+    const m = /\/__fonts\/css\?u=([^&#]+)/.exec(href || '');
+    if (!m) return null;
+    try { const u = decodeURIComponent(m[1]); return /^https:\/\/fonts\.googleapis\.com\//.test(u) ? u : null; } catch (_) { return null; }
+  }
+
   hp.collectStyles = function (ids) {
     const rules = [];
     const links = [];
+    const addLink = (u) => { if (u && !links.includes(u)) links.push(u); };
     for (const sheet of Array.from(document.styleSheets)) {
       const node = sheet.ownerNode;
       if (!node || (node.hasAttribute && node.hasAttribute('data-hp-ui-style'))) continue;
+      const font = unproxyFont(sheet.href);
+      if (font) { addLink(font); continue; }
       let list;
-      try { list = sheet.cssRules; } catch (_) { if (sheet.href) links.push(sheet.href); continue; }
-      for (const r of Array.from(list)) rules.push(r);
+      try { list = sheet.cssRules; } catch (_) { if (sheet.href && !/^hpres:/.test(sheet.href)) addLink(sheet.href); continue; }
+      for (const r of Array.from(list)) {
+        const imported = r.type === 3 ? unproxyFont(r.href) : null; // CSSImportRule
+        if (imported) { addLink(imported); continue; }
+        rules.push(r);
+      }
     }
-    document.querySelectorAll('link[rel~="stylesheet"][href]').forEach((l) => { if (!links.includes(l.href) && !/^hpres:/.test(l.href)) links.push(l.href); });
+    document.querySelectorAll('link[rel~="stylesheet"][href]').forEach((l) => {
+      const font = unproxyFont(l.href);
+      if (font) addLink(font);
+      else if (!/^hpres:/.test(l.href)) addLink(l.href);
+    });
 
     return ids.map((id) => {
       const slide = document.querySelector(`[data-hp-id="${id}"]`);

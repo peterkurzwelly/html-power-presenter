@@ -58,6 +58,8 @@
     </div>
 
     <div class="tb-group tb-right">
+      <span id="offlineMark" class="dirty offline" hidden title="Testa utan nät är på (Bildspel-menyn). Decket visas som om datorn saknade nät.">Utan nät</span>
+      <button id="windowedBtn" class="btn toggle" title="Fönsterläge: presentatörsvyn och publiken i egna fönster, sida vid sida även på en skärm. Dela publikfönstret i Teams eller Zoom.">⧉ Fönsterläge</button>
       <button id="rehearseBtn" class="btn" title="Öva med presentatörsvy (⌥⌘↩)">Presentatörsvy</button>
       <button id="presentBtn" class="btn primary" title="Presentera från aktuell slide (⌘↩) · från början (⇧⌘↩)">▶ Presentera</button>
     </div>
@@ -114,16 +116,33 @@
 <section id="presenter" class="screen presenter" hidden>
   <header class="p-top">
     <div class="p-timer">
-      <span id="pTimer" class="p-time">0:00</span>
-      <button id="pPause" class="icon-btn" title="Pausa/fortsätt timer">⏸</button>
-      <button id="pReset" class="icon-btn" title="Nollställ timer (T)">↺</button>
+      <button id="pTimer" class="p-time" title="Klicka för att växla mellan tid kvar och förfluten tid">0:00</button>
+      <div class="p-timer-side">
+        <span id="pTimerSub" class="p-timer-sub"></span>
+        <span class="p-timer-btns">
+          <button id="pPause" class="icon-btn" title="Pausa/fortsätt timer (S)">⏸</button>
+          <button id="pReset" class="icon-btn" title="Nollställ timer (T)">↺</button>
+          <button id="pTargetBtn" class="icon-btn" title="Talets längd">Mål</button>
+        </span>
+      </div>
+      <form id="pTargetPop" class="p-pop" hidden>
+        <label for="pTargetMin">Talets längd</label>
+        <span class="p-pop-row"><input id="pTargetMin" type="number" min="1" max="600" step="1" placeholder="20"> min</span>
+        <span class="p-pop-row"><button type="submit" class="btn small primary">Spara</button><button type="button" id="pTargetNone" class="btn small">Inget mål</button></span>
+        <span class="muted small">Sparas för den här filen.</span>
+      </form>
     </div>
     <div id="pClock" class="p-clock"></div>
-    <div id="pCount" class="p-count"></div>
+    <div class="p-countbox">
+      <div id="pCount" class="p-count"></div>
+      <div id="pPace" class="p-pace" hidden></div>
+    </div>
     <div class="p-spacer"></div>
+    <div id="pFileChip" class="p-chip" hidden><span>Ny version av filen – läses in när bildspelet är slut.</span><button id="pLoadNow" class="btn small">Läs in nu</button></div>
     <button id="pBlack" class="btn" title="Svart skärm (B)">Svart</button>
     <button id="pWhite" class="btn" title="Vit skärm (W)">Vit</button>
     <button id="pGridBtn" class="btn" title="Alla slides (G)">Alla slides</button>
+    <button id="pWindowed" class="btn toggle" title="Fönsterläge: presentatörsvyn och publiken i egna fönster (även på en skärm)">⧉ Fönster</button>
     <button id="pSwap" class="btn" title="Byt vilken skärm som visar vad">Byt skärmar</button>
     <button id="pEnd" class="btn danger" title="Avsluta (Esc)">Avsluta</button>
   </header>
@@ -142,7 +161,8 @@
     <section class="p-side">
       <div class="p-label">Nästa</div>
       <div class="p-next-box">
-        <div id="pNextStage" class="p-stage"></div>
+        <div id="pNextStage" class="p-stage p-next-ph"></div>
+        <img id="pNextImg" class="p-next-img" alt="" hidden>
         <div id="pNextEnd" class="p-overlay" hidden>Slut på bildspelet</div>
       </div>
       <div class="p-notes-head">
@@ -188,6 +208,18 @@
         <button id="impGo" class="btn primary" disabled>Välj slides</button>
       </div>
     </footer>
+  </div>
+</div>
+
+<!-- ============================== VERSIONER ============================== -->
+<div id="versionsDlg" class="modal" hidden>
+  <div class="modal-box versions-box" role="dialog" aria-labelledby="verTitle">
+    <header class="modal-head">
+      <h2 id="verTitle">Tidigare versioner av <span id="verName"></span></h2>
+      <button id="verClose" class="icon-btn" title="Stäng (Esc)">✕</button>
+    </header>
+    <p class="modal-hint muted">En kopia sparas varje gång filen öppnas, sparas eller skrivs om utanför appen (t.ex. av ett AI-verktyg). Återställ ersätter filen med versionen; den nuvarande finns kvar i listan.</p>
+    <ol id="verList" class="ver-list"></ol>
   </div>
 </div>
 

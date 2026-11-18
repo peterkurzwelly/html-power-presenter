@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('hp', {
   reorderSlides: (ids, order, rev) => ipcRenderer.invoke('slides-reorder', { ids, order, rev }),
   removeSlides: (ids, indices, rev) => ipcRenderer.invoke('slides-remove', { ids, indices, rev }),
   duplicateSlide: (ids, index, rev) => ipcRenderer.invoke('slides-duplicate', { ids, index, rev }),
+  setSlideIds: (ids, values, rev) => ipcRenderer.invoke('slides-set-ids', { ids, values, rev }),
   importPick: () => ipcRenderer.invoke('import-pick'),
   importCancel: () => ipcRenderer.invoke('import-cancel'),
   importRun: (opts) => ipcRenderer.invoke('import-run', opts),
@@ -42,6 +43,19 @@ contextBridge.exposeInMainWorld('hp', {
   presentStart: (opts) => ipcRenderer.invoke('present-start', opts),
   presentStop: () => ipcRenderer.invoke('present-stop'),
   presentSwap: () => ipcRenderer.invoke('present-swap'),
+  presentWindowed: (on) => ipcRenderer.invoke('present-windowed', !!on),
+  loadPending: () => ipcRenderer.invoke('load-pending'),
+  testOffline: (on) => ipcRenderer.invoke('test-offline', !!on),
+  talkGet: () => ipcRenderer.invoke('talk-get'),
+  talkSet: (minutes) => ipcRenderer.invoke('talk-set', minutes),
+
+  versionsList: () => ipcRenderer.invoke('versions-list'),
+  versionRestore: (id) => ipcRenderer.invoke('version-restore', id),
+  versionSaveCopy: (id) => ipcRenderer.invoke('version-save-copy', id),
+
+  copySlide: (o) => ipcRenderer.invoke('copy-slide', o),
+  copyDeck: (o) => ipcRenderer.invoke('copy-deck', o),
+  openInEditor: (id) => ipcRenderer.invoke('open-in-editor', id),
   presentSync: (state) => ipcRenderer.send('present-sync', state),
   displays: () => ipcRenderer.invoke('displays'),
 
@@ -56,4 +70,5 @@ contextBridge.exposeInMainWorld('hp', {
   onPresentStopped: on('present-stopped'),
   onSync: on('sync'),
   onFlush: on('flush'),
+  onFilePending: on('file-pending'),
 });

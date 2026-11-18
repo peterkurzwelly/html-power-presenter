@@ -26,7 +26,9 @@
   "scripts": {
     "start": "electron .",
     "dual": "HP_FAKE_DUAL=1 electron .",
-    "test": "node scripts/smoke-test.mjs",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node scripts/unit-deckstore.mjs && node scripts/unit-studio.mjs",
+    "test:e2e": "node scripts/smoke-test.mjs examples/demo-deck.html",
     "package": "node scripts/package.mjs",
     "install-app": "node scripts/package.mjs --install"
   },

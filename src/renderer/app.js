@@ -1,6 +1,7 @@
 // app.js — huvudfönstrets UI: startsida, normalvy, rutnät, redigering och presentatörsvy.
 import { SlideView } from './slideview.js';
-import { cleanInfo } from './deckinfo.mjs';
+import { cleanInfo, cleanOutline } from './deckinfo.mjs';
+import { parseBudget, planFor, pace, clock, roughMinutes, warnAt } from './timing.mjs';
 
 const $ = (id) => document.getElementById(id);
 const hp = window.hp;
@@ -28,6 +29,13 @@ const state = {
   busy: false,         // en slide-ändring väntar på svar
   hpsel: null,         // slide-regeln som hittade slidesen förra gången (samma fil)
   thumbsSeen: new Set(), // miniatyrer som kommit för nuvarande token
+  budgets: [],         // sekunder per slide ur anteckningarna ("~1.5 min · …"), eller null
+  plan: null,          // planen för hela talet (timing.mjs)
+  talkMin: null,       // talets mållängd i minuter (sparas per fil)
+  slideEnter: 0,       // timerns tid (s) när du kom till nuvarande slide
+  windowed: false,     // fönsterläge: presentatörsvy och publik i egna fönster
+  testOffline: false,  // Testa utan nät är på
+  versions: null,      // listan i dialogen Tidigare versioner, när den är öppen
 };
 
 const ui = {
@@ -37,7 +45,6 @@ const ui = {
 
 const mainView = new SlideView($('stage'), { mode: 'main', interactive: true });
 let pCur = null;
-let pNext = null;
 
 const url = (mode) => `${state.deck.baseUrl}?hp=${mode}&rev=${state.deck.rev}${state.hpsel ? '&hpsel=' + encodeURIComponent(state.hpsel) : ''}`;
 const count = () => (state.info ? state.info.count : 0);
@@ -112,8 +119,10 @@ document.addEventListener('drop', (e) => {
 
 hp.onDeckState(async (s) => {
   state.deck = s.open ? s : null;
+  updatePrefs(s);
   // Huvudprocessen har redan stängt importen när decket stängs eller byts.
   if (state.imp && (!s.open || (s.reload && s.path !== state.loadedPath))) { state.imp = null; $('importDlg').hidden = true; }
+  if (state.versions && (!s.open || s.path !== state.versionsPath)) closeVersions();
   if (!s.open) {
     state.loading = false;
     state.loadedPath = null;
@@ -129,9 +138,19 @@ hp.onDeckState(async (s) => {
   if (s.reload) await loadDeck(s);
 });
 
+// Fönsterläge och Testa utan nät gäller oavsett vilken fil som är öppen.
+function updatePrefs(s) {
+  if (typeof s.windowed === 'boolean') state.windowed = s.windowed;
+  if (typeof s.testOffline === 'boolean') state.testOffline = s.testOffline;
+  $('windowedBtn').classList.toggle('on', state.windowed);
+  $('pWindowed').classList.toggle('on', state.presenting ? !!state.presenting.windowed : state.windowed);
+  $('offlineMark').hidden = !state.testOffline;
+}
+
 function updateChrome() {
   const d = state.deck;
   if (!d) return;
+  renderStatusRight();
   $('docName').textContent = d.name;
   $('docName').parentElement.title = d.path;
   $('dirtyMark').hidden = !d.dirty;
@@ -140,6 +159,34 @@ function updateChrome() {
   $('saveBtn').disabled = !d.dirty;
   $('undoBtn').disabled = !d.canUndo;
   $('redoBtn').disabled = !d.canRedo;
+  renderFileChip();
+}
+
+// ”Ny version av filen” under bildspelet: följer huvudprocessens pendingFile.
+function renderFileChip() {
+  $('pFileChip').hidden = !(state.presenting && state.deck && state.deck.pendingFile);
+}
+
+// Statusraden till höger: planerad tid enligt anteckningarna, målet och typsnitten.
+function renderStatusRight() {
+  const bits = [];
+  if (state.plan) {
+    const known = state.budgets.reduce((t, b) => t + (b > 0 ? b : 0), 0);
+    bits.push(state.plan.missing
+      ? `${roughMinutes(known)} i anteckningarna för ${state.plan.explicit} av ${count()} slides`
+      : `≈ ${roughMinutes(known)} enligt anteckningarna`);
+  }
+  if (state.talkMin) bits.push(`mål ${state.talkMin} min`);
+  const f = state.deck && state.deck.fonts;
+  if (f && f.count) bits.push(f.ready === f.count ? 'Google Fonts sparade för visning utan nät ✓' : `Google Fonts: ${f.ready} av ${f.count} sparade – öppna decket med nät en gång`);
+  $('statusRight').textContent = bits.join(' · ');
+}
+
+// Budgetar och plan ur anteckningarna (och målet, om det finns).
+function computePlan() {
+  state.budgets = state.info && !state.info.whole ? state.info.notes.map(parseBudget) : [];
+  state.plan = planFor(state.budgets, state.talkMin ? state.talkMin * 60 : null);
+  renderStatusRight();
 }
 
 async function loadDeck(s) {
@@ -147,7 +194,8 @@ async function loadDeck(s) {
   const pending = sameFile ? state.pending : null;
   state.pending = null;
   const startIndex = pending ? pending.index : sameFile ? state.index : (s.lastIndex || 0);
-  const oldIds = sameFile && state.info ? state.info.ids.join(',') : null;
+  const oldInfo = sameFile ? state.info : null;
+  const oldIds = oldInfo ? oldInfo.ids.join(',') : null;
   state.loadedPath = s.path;
   state.token += 1;
   state.thumbsSeen = new Set();
@@ -175,13 +223,24 @@ async function loadDeck(s) {
   state.infoRev = s.rev;
   state.loading = false;
   state.hpsel = info.whole ? null : info.strategy;
+  if (!sameFile) { const t = await hp.talkGet().catch(() => null); state.talkMin = t && t.minutes ? t.minutes : null; }
+  computePlan();
   document.documentElement.style.setProperty('--ratio', String(info.size.w / info.size.h));
   if (pending && pending.thumbs && pending.thumbs.length === info.count) { state.thumbs = pending.thumbs; buildThumbLists(); }
   else if (!sameFile || countChanged || pending || orderChanged) { state.thumbs = []; buildThumbLists(); }
   else refreshTitles();
 
+  // Har filen skrivits om (t.ex. av Claude) hittas sliden igen på sitt fasta id, även om
+  // den har flyttats. Annars: samma plats som förut.
+  const follow = (idx) => {
+    const sid = oldInfo && oldInfo.slideIds && oldInfo.slideIds[idx];
+    const j = sid && info.slideIds ? info.slideIds.indexOf(sid) : -1;
+    return j >= 0 ? j : idx;
+  };
+  // Läget kan ha ändrats medan decket laddades (t.ex. när bildspelet avslutades).
+  const target = pending ? pending.index : sameFile && state.index >= 0 ? follow(state.index) : startIndex;
   state.index = -1;
-  go(clamp(startIndex, 0, info.count - 1));
+  go(clamp(target, 0, info.count - 1));
   if (state.edit) mainView.call('setEdit', true);
   $('statusMid').textContent = info.whole
     ? 'Hittade inga separata slides — visar hela sidan'
@@ -191,8 +250,14 @@ async function loadDeck(s) {
   hp.requestThumbs(state.token, null, state.hpsel);
 
   if (state.presenting) {
+    const run = state.presenting;
+    renderFileChip();
+    if (!pending && state.pIndex < (oldInfo ? oldInfo.count : 0)) state.pIndex = follow(state.pIndex);
     await loadPresenterViews(true);
+    if (state.presenting !== run) return; // bildspelet avslutades medan vyn laddades
     pGo(Math.min(state.pIndex, count()), true);
+    // Under bildspelet behövs inte huvudvyns kopia av decket: en levande kopia mindre.
+    mainView.unload();
   }
 }
 
@@ -282,6 +347,7 @@ hp.onThumb((t) => {
     if (!img) { img = document.createElement('img'); fig.prepend(img); }
     img.src = t.url;
   });
+  if (state.presenting && t.index === state.pIndex + 1) showNext(t.index);
 });
 
 let thumbQueue = new Set();
@@ -515,8 +581,8 @@ function canRestructure() {
   return true;
 }
 
-async function restructure(run, pending, message) {
-  if (!canRestructure()) return;
+async function restructure(run, pending, message, guard = canRestructure) {
+  if (!guard()) return;
   state.busy = true;
   try {
     await commitPending();
@@ -758,69 +824,136 @@ $('impGo').addEventListener('click', async () => {
 $('presentBtn').addEventListener('click', (e) => startPresenting({ from: e.shiftKey ? 0 : state.index }));
 $('rehearseBtn').addEventListener('click', () => startPresenting({ from: state.index, rehearse: true }));
 
+// Bara aktuell slide visas levande i presentatörsvyn. Nästa slide visas som miniatyrbild,
+// så att datorn inte kör ännu en kopia av decket under bildspelet.
 async function loadPresenterViews(force) {
-  if (!pCur) {
-    pCur = new SlideView($('pCurStage'), { mode: 'current', interactive: false });
-    pNext = new SlideView($('pNextStage'), { mode: 'next', interactive: false });
-  }
-  const tasks = [];
-  if (force || pCur.url !== url('current')) tasks.push(pCur.load(url('current'), state.pIndex));
-  if (force || pNext.url !== url('next')) tasks.push(pNext.load(url('next'), state.pIndex + 1));
-  await Promise.all(tasks).catch((err) => toast(err.message, 'error'));
+  if (!pCur) pCur = new SlideView($('pCurStage'), { mode: 'current', interactive: false });
+  if (force || pCur.url !== url('current')) await pCur.load(url('current'), state.pIndex).catch((err) => toast(err.message, 'error'));
+}
+
+function showNext(i) {
+  const img = $('pNextImg');
+  const ph = $('pNextStage');
+  if (!state.info || i >= count()) { img.hidden = true; ph.textContent = ''; return; }
+  ph.textContent = state.info.titles[i] || `Slide ${i + 1}`;
+  const src = state.thumbs[i];
+  if (src) { if (img.getAttribute('src') !== src) img.src = src; img.hidden = false; }
+  else { img.hidden = true; img.removeAttribute('src'); }
 }
 
 async function startPresenting({ from = 0, rehearse = false } = {}) {
-  if (!state.info) return;
-  await commitPending();
-  if (state.edit) setEdit(false);
-  state.pIndex = clamp(from, 0, count() - 1);
-  state.blank = null;
-  const res = await hp.presentStart({ rehearse, hpsel: state.hpsel });
-  if (!res) return;
-  state.presenting = { rehearse, dual: res.dual };
-  showScreen('presenter');
+  if (!state.info || state.presenting || state.starting) return;
+  state.starting = true; // ett dubbelklick startar inte två bildspel
+  try {
+    await commitPending();
+    if (!state.info || state.presenting) return;
+    if (state.edit) setEdit(false);
+    state.pIndex = clamp(from, 0, count() - 1);
+    state.blank = null;
+    const res = await hp.presentStart({ rehearse, hpsel: state.hpsel, size: state.info.size });
+    if (!res || !state.info || !state.deck) return;
+    const run = { rehearse, dual: res.dual, windowed: !!res.windowed };
+    state.presenting = run;
+    showScreen('presenter');
+    renderFileChip();
+    // Startar du om bildspelet strax efter att du avslutat det (t.ex. efter en Esc av
+    // misstag) fortsätter timern där den var. Inte efter en övning, och inte när du
+    // börjar om från första sliden. T nollställer.
+    const resume = timer.path === state.deck.path && timer.rehearse === rehearse && timer.acc > 1000
+      && Date.now() - timer.stoppedAt < 15 * 60e3 && !(state.pIndex === 0 && timer.lastIndex > 0);
+    timer.path = state.deck.path;
+    timer.rehearse = rehearse;
+    if (resume) { timer.resume(); toast(`Timern fortsätter på ${clock(timer.elapsed() / 1000)} — T nollställer.`); }
+    else resetTimer();
+    state.slideEnter = timer.elapsed() / 1000;
+    markCurrent();
+    // Huvudvyns kopia av decket behövs inte under bildspelet. Laddas en ny version just
+    // nu gör loadDeck det när den är klar.
+    if (!state.loading) mainView.unload();
+    await loadPresenterViews(false);
+    if (state.presenting !== run) return; // avslutat medan vyn laddades
+    pGo(state.pIndex, true);
+    updateBanner(res);
+    updatePrefs({});
+  } finally {
+    state.starting = false;
+  }
+}
+
+// Nollställer timern. Tempot räknas från sliden du står på, inte från första sliden.
+function resetTimer() {
   timer.reset();
-  markCurrent();
-  await loadPresenterViews(false);
-  pGo(state.pIndex, true);
-  updateBanner(res);
+  state.slideEnter = 0;
+  state.paceFrom = state.pIndex;
+  renderPace();
 }
 
 hp.onPresentLayout((l) => {
   if (!state.presenting) return;
   state.presenting.dual = l.dual;
+  state.presenting.windowed = !!l.windowed;
+  updatePrefs({});
   updateBanner(l);
 });
 
 function updateBanner(l) {
   const b = $('pBanner');
   $('pSwap').hidden = !l.dual;
-  if (l.fake) {
-    b.textContent = 'Testläge — publikfönstret visas som ett vanligt fönster.';
-    b.hidden = false;
-  } else if (state.presenting && state.presenting.rehearse) {
+  if (state.presenting && state.presenting.rehearse) {
     b.textContent = 'Övningsläge — inget publikfönster visas. Esc avslutar.';
-    b.hidden = false;
+  } else if (l.windowed) {
+    b.textContent = `Fönsterläge — dela fönstret ”Publik – ${state.deck ? state.deck.name : ''}” i Teams eller Zoom. F byter till helskärm.`;
   } else if (!l.dual) {
-    b.textContent = 'Bara en skärm hittades — publikfönstret ligger i helskärm ovanpå. Anslut en skärm så flyttas det dit.';
-    b.hidden = false;
-  } else b.hidden = true;
+    b.textContent = 'Bara en skärm — publiken ligger i helskärm ovanpå. Tryck F för fönsterläge med presentatörsvyn bredvid.';
+  } else { b.hidden = true; return; }
+  b.hidden = false;
   clearTimeout(updateBanner.t);
-  updateBanner.t = setTimeout(() => { b.hidden = true; }, 6000);
+  updateBanner.t = setTimeout(() => { b.hidden = true; }, 7000);
 }
 
 hp.onPresentStopped(() => exitPresenterUI());
 
+hp.onFilePending(() => { if (state.deck) state.deck.pendingFile = true; renderFileChip(); });
+$('pLoadNow').addEventListener('click', async () => { $('pFileChip').hidden = true; await hp.loadPending(); });
+
 function exitPresenterUI() {
   if (!state.presenting) return;
   state.presenting = null;
-  timer.stop();
+  timer.lastIndex = state.pIndex;
+  timer.freeze();
   togglePGrid(false);
-  if (pCur) { pCur.unload(); pNext.unload(); }
+  showTargetPop(false);
+  $('pFileChip').hidden = true;
+  if (pCur) pCur.unload();
   showScreen(state.deck ? 'workspace' : 'start');
-  const target = clamp(state.pIndex, 0, count() - 1);
+  updatePrefs({});
+  restoreMainView(clamp(state.pIndex, 0, count() - 1));
+}
+
+// Laddar huvudvyn igen efter bildspelet (den lades ner under tiden).
+async function restoreMainView(i) {
+  if (!state.deck || !state.info) return;
+  state.index = i; // en laddning som redan pågår hamnar då här
+  if (state.loading) return;
+  // Filen ändrades under bildspelet och huvudvyn har inte hunnit med: ladda allt.
+  if (state.deck.rev !== state.infoRev) { await loadDeck(state.deck); return; }
+  if (!mainView.ready || mainView.url !== url('main')) {
+    state.loading = true;
+    let info = null;
+    try { info = await mainView.load(url('main'), i); }
+    catch (err) {
+      state.loading = false;
+      $('stageMsg').textContent = 'Kunde inte visa presentationen: ' + err.message;
+      $('stageMsg').hidden = false;
+      return;
+    }
+    if (!info) return; // ersatt av en nyare laddning
+    state.loading = false;
+  }
+  const at = state.index;
   state.index = -1;
-  go(target);
+  go(clamp(at, 0, count() - 1));
+  if (state.edit) mainView.call('setEdit', true);
   mainView.relayout();
 }
 
@@ -830,16 +963,18 @@ function pGo(i, force = false) {
   const n = count();
   i = clamp(i, 0, n); // n = "slut på bildspelet"
   if (i === state.pIndex && !force) return;
+  if (i !== state.pIndex) state.slideEnter = timer.elapsed() / 1000;
   state.pIndex = i;
   const ended = i >= n;
   if (pCur) pCur.show(Math.min(i, n - 1));
-  if (pNext) { if (i + 1 < n) pNext.show(i + 1); }
+  showNext(i + 1);
   $('pNextEnd').hidden = i + 1 < n;
   $('pNextEnd').textContent = ended ? '' : 'Slut på bildspelet';
   const notes = ended ? '' : (state.info.notes[i] || '');
   $('pNotes').textContent = notes || (ended ? '' : 'Inga anteckningar.');
   $('pNotes').classList.toggle('empty', !notes);
   renderCount();
+  renderPace();
   renderOverlay();
   markCurrent();
   sync();
@@ -854,6 +989,29 @@ function renderCount() {
   if (ended) el.append('Slut ', span('muted', `· ${n} slides`));
   else el.append('Slide ', span('b', String(state.pIndex + 1)), ` av ${n}`);
   if (state.gotoBuf) el.append(span('goto', `Gå till ${state.gotoBuf}…`));
+}
+
+// Tid på sliden mot dess budget, och om du ligger före, i fas eller efter planen.
+function renderPace() {
+  const el = $('pPace');
+  const n = count();
+  if (!state.presenting || !state.plan || state.pIndex >= n) { el.hidden = true; return; }
+  const i = state.pIndex;
+  const now = timer.elapsed() / 1000;
+  const onSlide = Math.max(0, now - state.slideEnter);
+  const budget = state.plan.per[i];
+  const explicit = state.budgets[i] > 0;
+  // Startade du mitt i decket räknas planen därifrån.
+  const from = clamp(state.paceFrom || 0, 0, state.plan.starts.length - 1);
+  const p = pace(state.plan, i, now + (state.plan.starts[from] || 0));
+  const span = (cls, text) => { const x = document.createElement('span'); x.className = cls; x.textContent = text; return x; };
+  el.replaceChildren(
+    span(onSlide > budget ? 'long' : '', `Sliden ${clock(onSlide)} / ${explicit ? '' : '≈'}${clock(budget)}`),
+    ' · ',
+    p.state === 'on' ? span('on', 'i fas') : span(p.state, `${clock(p.delta)} ${p.state === 'ahead' ? 'före' : 'efter'} planen`),
+  );
+  el.title = explicit ? 'Budget ur anteckningarna' : 'Den här sliden saknar budget i anteckningarna; tiden är uppskattad.';
+  el.hidden = false;
 }
 
 function renderOverlay() {
@@ -886,7 +1044,15 @@ function togglePGrid(force) {
   if (show) requestAnimationFrame(markCurrent);
 }
 
+function toggleWindowed() { hp.presentWindowed(!(state.presenting ? state.presenting.windowed : state.windowed)); }
+
 $('pPrev').addEventListener('click', () => pGo(state.pIndex - 1));
+// Knappar i presentatörsvyn behåller inte fokus, så Enter och mellanslag bläddrar
+// i stället för att trycka på knappen igen.
+$('presenter').addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('button');
+  if (b && !b.closest('#pTargetPop')) b.blur();
+});
 $('pNext').addEventListener('click', () => pGo(state.pIndex + 1));
 $('pBlack').addEventListener('click', () => setBlank('black'));
 $('pWhite').addEventListener('click', () => setBlank('white'));
@@ -894,6 +1060,8 @@ $('pGridBtn').addEventListener('click', () => togglePGrid());
 $('pGridClose').addEventListener('click', () => togglePGrid(false));
 $('pSwap').addEventListener('click', () => hp.presentSwap());
 $('pEnd').addEventListener('click', stopPresenting);
+$('pWindowed').addEventListener('click', toggleWindowed);
+$('windowedBtn').addEventListener('click', toggleWindowed);
 
 let notesSize = 20;
 try { notesSize = +(localStorage.getItem('notesSize') || 20); } catch (_) {}
@@ -906,29 +1074,236 @@ setNotesSize(notesSize);
 $('pFontUp').addEventListener('click', () => setNotesSize(notesSize + 2));
 $('pFontDown').addEventListener('click', () => setNotesSize(notesSize - 2));
 
+/* ---- timern: förfluten tid, eller tid kvar när talet har ett mål */
+
+let timerMode = 'remaining';
+try { timerMode = localStorage.getItem('timerMode') === 'elapsed' ? 'elapsed' : 'remaining'; } catch (_) {}
+
 const timer = {
-  start: 0, acc: 0, paused: false, iv: null,
-  reset() { this.acc = 0; this.start = Date.now(); this.paused = false; this.run(); this.render(); },
-  stop() { clearInterval(this.iv); this.iv = null; },
+  acc: 0, start: 0, running: false, iv: null, path: null, stoppedAt: 0,
+  elapsed() { return this.acc + (this.running ? Date.now() - this.start : 0); },
+  reset() { this.acc = 0; this.start = Date.now(); this.running = true; this.run(); this.render(); },
+  resume() { this.start = Date.now(); this.running = true; this.run(); this.render(); },
   toggle() {
-    if (this.paused) { this.start = Date.now(); this.paused = false; }
-    else { this.acc += Date.now() - this.start; this.paused = true; }
+    if (this.running) { this.acc += Date.now() - this.start; this.running = false; }
+    else { this.start = Date.now(); this.running = true; }
     this.render();
   },
-  elapsed() { return this.acc + (this.paused ? 0 : Date.now() - this.start); },
-  run() { this.stop(); this.iv = setInterval(() => this.render(), 500); },
+  // När bildspelet avslutas: tiden står still och kan fortsätta om du startar igen strax.
+  freeze() {
+    if (this.running) { this.acc += Date.now() - this.start; this.running = false; }
+    this.stoppedAt = Date.now();
+    clearInterval(this.iv); this.iv = null;
+  },
+  run() { clearInterval(this.iv); this.iv = setInterval(() => this.render(), 500); },
   render() {
-    const s = Math.floor(this.elapsed() / 1000);
-    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-    $('pTimer').textContent = (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + ':' + String(sec).padStart(2, '0');
-    $('pTimer').classList.toggle('paused', this.paused);
-    $('pPause').textContent = this.paused ? '▶' : '⏸';
-    const now = new Date();
-    $('pClock').textContent = now.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+    const el = this.elapsed() / 1000;
+    const target = state.talkMin ? state.talkMin * 60 : null;
+    const t = $('pTimer');
+    const rem = target ? target - el : null;
+    let main, sub;
+    if (target && timerMode === 'remaining') {
+      main = rem >= 0 ? clock(rem) : '+' + clock(-rem);
+      sub = rem >= 0 ? `kvar av ${state.talkMin} min` : `över ${state.talkMin} min`;
+    } else {
+      main = clock(el);
+      sub = target ? (rem >= 0 ? `${clock(rem)} kvar av ${state.talkMin} min` : `${clock(-rem)} över ${state.talkMin} min`) : 'förfluten tid';
+    }
+    if (target && rem > 0 && this.running) {
+      const end = new Date(Date.now() + rem * 1000);
+      sub += ` · slut ${end.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}`;
+    }
+    if (!this.running) sub = 'pausad · ' + sub;
+    t.textContent = main;
+    t.classList.toggle('over', !!target && rem < 0);
+    t.classList.toggle('warn', !!target && rem >= 0 && rem <= warnAt(target));
+    t.classList.toggle('paused', !this.running);
+    $('pTimerSub').textContent = sub;
+    $('pPause').textContent = this.running ? '⏸' : '▶';
+    $('pTargetBtn').textContent = state.talkMin ? `${state.talkMin} min` : 'Mål';
+    $('pClock').textContent = new Date().toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+    renderPace();
   },
 };
 $('pPause').addEventListener('click', () => timer.toggle());
-$('pReset').addEventListener('click', () => timer.reset());
+$('pReset').addEventListener('click', () => resetTimer());
+$('pTimer').addEventListener('click', () => {
+  if (!state.talkMin) { showTargetPop(true); return; }
+  timerMode = timerMode === 'remaining' ? 'elapsed' : 'remaining';
+  try { localStorage.setItem('timerMode', timerMode); } catch (_) {}
+  timer.render();
+});
+
+function showTargetPop(show) {
+  const pop = $('pTargetPop');
+  pop.hidden = !show;
+  if (show) { $('pTargetMin').value = state.talkMin || ''; $('pTargetMin').focus(); $('pTargetMin').select(); }
+  else if (document.activeElement && pop.contains(document.activeElement)) document.activeElement.blur();
+}
+
+async function setTalkMin(minutes) {
+  const res = await hp.talkSet(minutes);
+  state.talkMin = res && res.minutes ? res.minutes : null;
+  computePlan();
+  timer.render();
+}
+
+$('pTargetBtn').addEventListener('click', () => showTargetPop($('pTargetPop').hidden));
+$('pTargetPop').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const m = parseInt($('pTargetMin').value, 10);
+  showTargetPop(false);
+  await setTalkMin(Number.isInteger(m) && m > 0 ? Math.min(600, m) : null);
+});
+$('pTargetNone').addEventListener('click', async () => { showTargetPop(false); await setTalkMin(null); });
+
+/* ====================================================== tidigare versioner */
+
+async function openVersions() {
+  if (!state.deck) return;
+  await commitPending();
+  const list = await hp.versionsList();
+  if (!state.deck) return;
+  state.versions = list;
+  state.versionsPath = state.deck.path;
+  $('verName').textContent = state.deck.name;
+  const ol = $('verList');
+  ol.replaceChildren();
+  if (!list.length) {
+    const li = document.createElement('li');
+    li.className = 'ver-empty';
+    li.textContent = 'Inga sparade versioner ännu.';
+    ol.appendChild(li);
+  }
+  list.forEach((v, k) => {
+    const li = document.createElement('li');
+    const when = new Date(v.at);
+    const a = document.createElement('div');
+    const w = document.createElement('div');
+    w.className = 'v-when';
+    w.textContent = when.toLocaleString('sv-SE', { dateStyle: 'medium', timeStyle: 'medium' });
+    const m = document.createElement('div');
+    m.className = 'v-meta';
+    m.textContent = `${v.label} · ${v.size >= 1048576 ? (v.size / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(v.size / 1024)) + ' kB'}`;
+    a.append(w, m);
+    const cur = document.createElement('span');
+    cur.className = 'v-cur';
+    cur.textContent = k === 0 ? 'senast' : '';
+    const copy = document.createElement('button');
+    copy.className = 'btn small';
+    copy.textContent = 'Spara kopia…';
+    copy.addEventListener('click', async () => {
+      const r = await hp.versionSaveCopy(v.id);
+      if (r && r.error) toast(r.error, 'error');
+      else if (r && r.ok) toast(`Sparad som ${r.name}.`);
+    });
+    const restore = document.createElement('button');
+    restore.className = 'btn small primary';
+    restore.textContent = 'Återställ';
+    restore.addEventListener('click', async () => {
+      if (!confirm(`Återställ versionen från ${w.textContent}?\n\nFilen ersätts med den här versionen. Versionen du har nu finns kvar i listan.`)) return;
+      const r = await hp.versionRestore(v.id);
+      if (r && r.error) { toast(r.error, 'error'); return; }
+      if (r && r.ok) { closeVersions(); toast('Versionen är återställd.'); }
+    });
+    li.append(a, cur, copy, restore);
+    ol.appendChild(li);
+  });
+  $('versionsDlg').hidden = false;
+}
+
+function closeVersions() {
+  state.versions = null;
+  state.versionsPath = null;
+  $('versionsDlg').hidden = true;
+}
+$('verClose').addEventListener('click', closeVersions);
+
+/* ====================================================== text till Claude */
+
+const budgetText = (i) => (state.budgets[i] > 0 ? `~${clock(state.budgets[i])} min` : '');
+
+async function copySlideForClaude() {
+  const info = state.info;
+  if (!info || info.whole) { toast('Det här decket har inga separata slides.', 'error'); return; }
+  await commitPending();
+  if (state.loading || !state.deck || state.deck.rev !== state.infoRev) { toast('Vänta tills presentationen har laddats om.', 'error'); return; }
+  const i = state.index;
+  const res = await hp.copySlide({
+    ids: info.ids, index: i, rev: state.infoRev, title: info.titles[i], notes: info.notes[i],
+    slideId: info.slideIds[i], size: info.size, budget: budgetText(i),
+  });
+  if (!res || res.error) { toast((res && res.error) || 'Kunde inte kopiera sliden.', 'error'); return; }
+  toast(`Slide ${i + 1} kopierad för Claude${res.line ? ` (rad ${res.line} i filen)` : ''} — klistra in den i Claude.`);
+}
+
+async function copyDeckForClaude(recipe) {
+  const info = state.info;
+  if (info && info.whole) { toast('Det här decket har inga separata slides.', 'error'); return; }
+  if (state.presenting) { toast('Avsluta bildspelet först.', 'error'); return; }
+  if (!info || !mainView.ready) { toast('Vänta tills presentationen har laddats.', 'error'); return; }
+  if (recipe === 'cut' && !state.talkMin) { toast('Sätt ett mål för talet först (Mål i presentatörsvyn), så vet Claude hur kort decket ska bli.', 'error'); return; }
+  await commitPending();
+  const outline = cleanOutline(await mainView.call('outline').catch(() => null), info.count);
+  const slides = info.titles.map((title, i) => ({ title, text: outline[i], notes: info.notes[i], slideId: info.slideIds[i], budget: budgetText(i) }));
+  const res = await hp.copyDeck({
+    recipe, slides, size: info.size,
+    totalMin: state.plan && !state.plan.missing ? Math.max(1, Math.round(state.plan.total / 60)) : null,
+    targetMin: state.talkMin,
+  });
+  if (!res || res.error) { toast((res && res.error) || 'Kunde inte kopiera decket.', 'error'); return; }
+  toast(`Decket kopierat för Claude (${res.kb} kB text, utan bilder) — klistra in det i Claude.`);
+}
+
+async function openInEditor() {
+  const info = state.info;
+  if (!info || info.whole) { toast('Det här decket har inga separata slides.', 'error'); return; }
+  await commitPending();
+  const sel = state.edit && mainView.selection && typeof mainView.selection.id === 'string' ? mainView.selection.id : null;
+  const id = sel || info.ids[state.index];
+  const res = await hp.openInEditor(id);
+  if (!res || res.error) { toast((res && res.error) || 'Kunde inte öppna en kodeditor.', 'error'); return; }
+  toast(`Öppnar i ${res.editor}${res.noLine ? '' : ` på rad ${res.line}`}${res.dirty ? ' — spara först, annars stämmer inte raden' : ''}.`);
+}
+
+// Fasta id ur slidens rubrik: "Vad kostar det?" → "vad-kostar-det".
+function slugify(title, i) {
+  const base = String(title || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '');
+  return !base || /^slide-\d+$/.test(base) ? `slide-${i + 1}` : base;
+}
+
+// Id läggs till i varje slides egen starttagg, så slidesen behöver inte ligga i samma
+// behållare (som när ordningen ändras).
+function canAddIds() {
+  const info = state.info;
+  if (state.deck && state.deck.readOnly) { toast('Filen är inte sparad som UTF-8 och är därför skrivskyddad.', 'error'); return false; }
+  if (state.loading || state.busy || !state.deck || state.deck.rev !== state.infoRev) { toast('Vänta tills presentationen har laddats om.', 'error'); return false; }
+  if (!info || info.whole) { toast('Det här decket har inga separata slides.', 'error'); return false; }
+  if (!info.ids || info.ids.some((x) => x == null)) { toast('Hittade inte alla slides i källfilen.', 'error'); return false; }
+  return true;
+}
+
+function assignSlideIds() {
+  const info = state.info;
+  if (!canAddIds()) return;
+  const taken = new Set(info.slideIds.filter(Boolean));
+  const ids = [];
+  const values = [];
+  const seen = new Set(); // klonade slides delar element i källan
+  info.slideIds.forEach((sid, i) => {
+    if (sid || seen.has(info.ids[i])) return;
+    seen.add(info.ids[i]);
+    let v = slugify(info.titles[i], i);
+    for (let n = 2; taken.has(v); n++) v = `${slugify(info.titles[i], i).slice(0, 36)}-${n}`;
+    taken.add(v);
+    ids.push(info.ids[i]);
+    values.push(v);
+  });
+  if (!ids.length) { toast('Alla slides har redan fasta id.'); return; }
+  restructure((_all, rev) => hp.setSlideIds(ids, values, rev), { index: state.index, thumbs: state.thumbs.slice() },
+    `${ids.length} slide${ids.length === 1 ? '' : 's'} fick fasta id (data-slide-id) — spara för att skriva dem till filen. ⌘Z ångrar.`, canAddIds);
+}
 
 /* ============================================================== keyboard */
 
@@ -941,11 +1316,15 @@ function isTyping() {
 
 function handleKey(k) {
   if (state.imp) { if (k.key === 'Escape') closeImport(); return; }
+  if (state.versions) { if (k.key === 'Escape') closeVersions(); return; }
   if (k.metaKey || k.ctrlKey) return;
   const key = k.key;
 
   if (state.presenting) {
     const n = count();
+    // Från decket i publikfönstret: bara bläddring, släckning och Esc. Annars kunde ett
+    // skript i decket byta fönsterläge eller stoppa klockan.
+    if (k.viaDeck && /^[fFsStTgG]$/.test(key)) return;
     if (/^[0-9]$/.test(key)) { state.gotoBuf = (state.gotoBuf + key).slice(-3); renderCount(); clearTimeout(handleKey.t); handleKey.t = setTimeout(() => { state.gotoBuf = ''; renderCount(); }, 2500); return; }
     if (key === 'Enter' && state.gotoBuf) { const t = parseInt(state.gotoBuf, 10) - 1; state.gotoBuf = ''; pGo(clamp(t, 0, n - 1)); return; }
     switch (key) {
@@ -960,8 +1339,11 @@ function handleKey(k) {
       case 'b': case 'B': case '.': setBlank('black'); return;
       case 'w': case 'W': case ',': setBlank('white'); return;
       case 'g': case 'G': togglePGrid(); return;
-      case 't': case 'T': timer.reset(); return;
+      case 't': case 'T': resetTimer(); return;
+      case 's': case 'S': timer.toggle(); return;
+      case 'f': case 'F': if (!state.presenting.rehearse) toggleWindowed(); return;
       case 'Escape':
+        if (!$('pTargetPop').hidden) { showTargetPop(false); return; }
         if (!$('pGridOverlay').hidden) { togglePGrid(false); return; }
         stopPresenting(); return;
       default: return;
@@ -1013,12 +1395,20 @@ function gridCols() {
 
 document.addEventListener('keydown', (e) => {
   if (state.imp && e.key === 'Escape') { closeImport(); return; }
+  if (state.versions && e.key === 'Escape') { closeVersions(); return; }
+  if (e.key === 'Escape' && !$('pTargetPop').hidden) { showTargetPop(false); return; }
+  if (state.versions && !isTyping()) return;
   if (isTyping()) return;
   const nav = ['ArrowRight', 'ArrowLeft', 'ArrowUp', 'ArrowDown', ' ', 'PageUp', 'PageDown', 'Home', 'End'];
-  const inForm = e.target && (e.target.tagName === 'SELECT' || (e.target.closest && e.target.closest('#importDlg')));
+  const inForm = e.target && (e.target.tagName === 'SELECT' || (e.target.closest && e.target.closest('#importDlg, #versionsDlg, #pTargetPop')));
   if (inForm) return;
   if (nav.includes(e.key) && !e.metaKey) e.preventDefault();
-  if (e.target && e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) return;
+  if (e.target && e.target.tagName === 'BUTTON' && (e.key === ' ' || e.key === 'Enter')) {
+    // Under bildspelet bläddrar Enter och mellanslag, även om en knapp har fokus.
+    if (!state.presenting) return;
+    e.preventDefault();
+    e.target.blur();
+  }
   handleKey({ key: e.key, metaKey: e.metaKey, ctrlKey: e.ctrlKey, altKey: e.altKey, shiftKey: e.shiftKey });
 });
 
@@ -1032,7 +1422,8 @@ hp.onRemoteKey((k) => handleKey(k));
 /* ================================================================== menu */
 
 hp.onMenu((a) => {
-  if (state.imp && !['save', 'save-as', 'close', 'toggle-notes'].includes(a)) return;
+  if ((state.imp || state.versions) && !['save', 'save-as', 'close', 'toggle-notes'].includes(a)) return;
+  if (a.startsWith('copy-deck:')) { if (!state.presenting) copyDeckForClaude(a.slice(10)); return; }
   switch (a) {
     case 'save': save(false); break;
     case 'save-as': save(true); break;
@@ -1054,6 +1445,10 @@ hp.onMenu((a) => {
     case 'slide-first': if (!state.presenting) moveSlide(state.index, 0); break;
     case 'slide-last': if (!state.presenting) moveSlide(state.index, count()); break;
     case 'import': if (!state.presenting) openImport(); break;
+    case 'versions': if (!state.presenting) openVersions(); break;
+    case 'copy-slide': if (!state.presenting) copySlideForClaude(); break;
+    case 'open-editor': if (!state.presenting) openInEditor(); break;
+    case 'slide-ids': if (!state.presenting) assignSlideIds(); break;
     default: break;
   }
 });

@@ -26,6 +26,13 @@ const deckDir = path.join(out, 'deck');
 fs.mkdirSync(deckDir, { recursive: true });
 const deck = path.join(deckDir, path.basename(src));
 fs.copyFileSync(src, deck);
+// A Google Fonts link, to test that fonts are served through the app's offline cache.
+const GF = 'https://fonts.googleapis.com/css2?family=Inter:wght@400&display=swap';
+{
+  const t = fs.readFileSync(deck, 'utf8');
+  const i = t.search(/<\/head>/i);
+  if (i > 0) fs.writeFileSync(deck, t.slice(0, i) + `<link href="${GF.replace(/&/g, '&amp;')}" rel="stylesheet">\n` + t.slice(i));
+}
 fs.writeFileSync(path.join(out, 'outside.txt'), 'secret');
 fs.writeFileSync(path.join(deckDir, 'inside.txt'), 'ok');
 fs.writeFileSync(path.join(deckDir, 'inner.html'), '<!doctype html><body>inner ok</body>');
@@ -83,6 +90,26 @@ const menu = (action) => app.evaluate(({ BrowserWindow }, a) => {
   const w = BrowserWindow.getAllWindows().find((x) => x.webContents.getURL().includes('/ui/index.html'));
   w.webContents.send('menu', a);
 }, action);
+const clipboardText = () => app.evaluate(({ clipboard }) => clipboard.readText());
+// Clicks a menu item by its label (checkboxes flip like a real click).
+const clickMenuItem = (label) => app.evaluate(({ Menu, BrowserWindow }, l) => {
+  const find = (items) => { for (const it of items) { if (it.label === l) return it; if (it.submenu) { const f = find(it.submenu.items); if (f) return f; } } return null; };
+  const it = find(Menu.getApplicationMenu().items);
+  const w = BrowserWindow.getAllWindows().find((x) => x.webContents.getURL().includes('/ui/index.html'));
+  it.click({}, w, w.webContents);
+}, label);
+const winInfo = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed() && w.isVisible()).map((w) => ({
+  url: w.webContents.getURL(), title: w.getTitle(), bounds: w.getBounds(), content: w.getContentBounds(), full: w.isSimpleFullScreen(),
+})));
+const audienceInfo = async () => (await winInfo()).find((w) => w.url.includes('/ui/audience.html'));
+const presenterInfo = async () => (await winInfo()).find((w) => w.url.includes('/ui/index.html'));
+const displayCount = () => app.evaluate(({ screen }) => screen.getAllDisplays().length);
+const audienceFrame = async (aud) => {
+  let f = null;
+  for (let i = 0; i < 100 && !f; i++) { f = aud.frames().find((x) => x.url().includes('hp=audience')); if (!f) await wait(100); }
+  return f && f.waitForFunction(() => window.__hp && window.__hp.ready, null, { timeout: 20000 }).then(() => f, () => null);
+};
+const frameRev = (mode) => { const f = page.frames().find((x) => x.url().includes(`hp=${mode}`)); const m = f && /rev=(\d+)/.exec(f.url()); return m ? +m[1] : null; };
 const waitReload = async (count) => {
   await page.waitForFunction((n) => document.querySelectorAll('#thumbList li').length === n && !document.querySelector('#stage.sv-loading'), count, { timeout: 20000 });
   await wait(500);
@@ -303,28 +330,137 @@ check(await page.isHidden('#importDlg'), 'Esc closes the import dialog');
 
 /* --------------------------------------------------------------- presenting */
 
+check(await page.isHidden('#dirtyMark'), 'the deck is saved before presenting');
+check(await page.$eval('#windowedBtn', (b) => b.classList.contains('on')), 'window mode is on (the default in this test)');
 const audienceP = app.waitForEvent('window', { timeout: 15000 });
 await page.click('#thumbList li:nth-child(2)');
 await wait(300);
 await page.click('#presentBtn');
-const audience = await audienceP;
+let audience = await audienceP;
 await audience.waitForLoadState();
 audience.on('pageerror', (e) => check(false, 'no page errors in the audience window', e.message));
 await page.waitForSelector('#presenter:not([hidden])');
-let af = null;
-for (let i = 0; i < 100 && !af; i++) { af = audience.frames().find((x) => x.url().includes('hp=audience')); if (!af) await wait(100); }
-const audReady = af && await af.waitForFunction(() => window.__hp && window.__hp.ready, null, { timeout: 20000 }).then(() => true, () => false);
-check(!!audReady, 'audience window loads the deck');
-await wait(800);
+let af = await audienceFrame(audience);
+check(!!af, 'audience window loads the deck');
+await wait(1000);
+
+// Window mode: the presenter view and the audience are ordinary windows. On one screen
+// they sit side by side; the audience window keeps the slide's proportions.
+const ratio = await page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ratio')));
+const aw = await audienceInfo();
+const pw = await presenterInfo();
+check(aw && pw && !aw.full && !pw.full, 'window mode: neither window is full screen');
+check(aw && Math.abs(aw.content.width / aw.content.height - ratio) < 0.02, "window mode: the audience window has the slide's proportions", aw && `${aw.content.width}×${aw.content.height}, slide ${ratio.toFixed(3)}`);
+check(aw && aw.title === `Publik – ${path.basename(deck)}`, 'the audience window is named after the deck, to pick it when sharing', aw && aw.title);
+if ((await displayCount()) === 1) {
+  check(aw && pw && aw.bounds.x >= pw.bounds.x + pw.bounds.width - 2, 'window mode on one screen: the audience sits beside the presenter view', aw && pw && `presenter ${JSON.stringify(pw.bounds)}, audience ${JSON.stringify(aw.bounds)}`);
+}
+
+// Only the current slide runs live in the presenter view; the next one is a picture.
+const live = page.frames().map((f) => f.url()).filter((u) => /hp=(main|next|current)/.test(u)).map((u) => /hp=(\w+)/.exec(u)[1]);
+check(live.join(',') === 'current', 'during the show only the current slide runs live in the presenter view', live.join(', '));
+check(await page.isVisible('#pNextImg'), 'the next slide shows as a picture');
+
 await page.keyboard.press('ArrowRight');
 await wait(1000);
 await shot(page, '5-presenter');
 await shot(audience, '6-audience');
 const audIdx = af ? await af.evaluate(() => window.__hp.index) : null;
 check(audIdx === 2, 'audience follows the presenter', `audience index ${audIdx}, presenter "${await page.textContent('#pCount')}"`);
-await page.keyboard.press('Escape');
+
+// Talk length, countdown and pace from the time budgets in the notes.
+await page.click('#pTargetBtn');
+await page.fill('#pTargetMin', '20');
+await page.press('#pTargetMin', 'Enter');
+await wait(700);
+const tt = await page.textContent('#pTimer');
+const sub = await page.textContent('#pTimerSub');
+check(/^(19:5\d|20:00)$/.test(tt) && /kvar av 20 min/.test(sub), 'a talk length makes the timer count down', `${tt} · ${sub}`);
+const paceText = await page.$eval('#pPace', (e) => (e.hidden ? '' : e.textContent));
+check(/Sliden \d+:\d\d \/ ≈?\d+:\d\d/.test(paceText) && /(i fas|före|efter)/.test(paceText), 'time budgets in the notes show the pace on each slide', paceText);
+await page.keyboard.press('s');
+await wait(600);
+check(/pausad/.test(await page.textContent('#pTimerSub')), 'S pauses the timer');
+await page.keyboard.press('s');
+
+// Show lock: a file rewritten mid-talk is not loaded until the show ends.
+const revBefore = frameRev('current');
+fs.appendFileSync(deck, '\n<!-- changed by another tool -->\n');
+await page.waitForSelector('#pFileChip:not([hidden])', { timeout: 8000 }).catch(() => {});
 await wait(800);
+check(await page.isVisible('#pFileChip') && frameRev('current') === revBefore, 'a file changed during the show waits until the show is over', `rev ${revBefore} → ${frameRev('current')}`);
+
+// F switches between window mode and full screen mid-show; the audience keeps its slide.
+let nextAud = app.waitForEvent('window', { timeout: 15000 });
+await page.keyboard.press('f');
+audience = await nextAud;
+await audience.waitForLoadState();
+af = await audienceFrame(audience);
+await wait(1000);
+let a2 = await audienceInfo();
+check(a2 && a2.full && af && (await af.evaluate(() => window.__hp.index)) === 2, 'F switches the audience to full screen, on the same slide', a2 && `full ${a2.full}`);
+nextAud = app.waitForEvent('window', { timeout: 15000 });
+await page.keyboard.press('f');
+audience = await nextAud;
+await audience.waitForLoadState();
+af = await audienceFrame(audience);
+await wait(800);
+a2 = await audienceInfo();
+check(a2 && !a2.full && !!af, 'F again goes back to window mode');
+
+await page.keyboard.press('Escape');
+await wait(1000);
 check(await page.isVisible('#workspace'), 'Esc ends the presentation');
+const reloaded = await page.waitForFunction((r) => {
+  const f = [...document.querySelectorAll('iframe')].map((x) => x.src).find((u) => u.includes('hp=main'));
+  const m = f && /rev=(\d+)/.exec(f);
+  return m && +m[1] > r;
+}, revBefore, { timeout: 10000 }).then(() => true, () => false);
+check(reloaded && fs.readFileSync(deck, 'utf8').includes('changed by another tool'), 'the changed file is loaded when the show ends');
+await page.waitForFunction(() => !document.querySelector('#stage.sv-loading'), null, { timeout: 20000 });
+await wait(800);
+const right = await page.textContent('#statusRight');
+check(/(≈ \d+ min enligt anteckningarna|\d+ (min|s) i anteckningarna för \d+ av \d+ slides)/.test(right) && /mål 20 min/.test(right), 'the status bar shows the planned time and the talk length', right);
+
+// A double click on ▶ Presentera starts one show, with the right window-mode state.
+let audP = app.waitForEvent('window', { timeout: 15000 });
+await page.dblclick('#presentBtn');
+audience = await audP;
+await audience.waitForLoadState();
+af = await audienceFrame(audience);
+await page.waitForSelector('#presenter:not([hidden])');
+await wait(1200);
+check(await page.$eval('#pWindowed', (b) => b.classList.contains('on')), 'a double click starts one show and window mode stays lit');
+
+// A script in the deck can post fake key presses. In the audience window they can turn
+// pages but not switch window mode or stop the timer.
+let extraWindow = false;
+const onWin = () => { extraWindow = true; };
+app.on('window', onWin);
+const fakeKey = (key) => af.evaluate((k) => parent.postMessage({ hp: 1, type: 'event', name: 'key', data: { key: k } }, '*'), key);
+await fakeKey('f');
+await fakeKey('s');
+await wait(1500);
+const a3 = await audienceInfo();
+check(!extraWindow && a3 && !a3.full && !/pausad/.test(await page.textContent('#pTimerSub')), 'keys sent by the deck in the audience window cannot switch window mode or pause the timer');
+const slideNo = async () => +(/Slide (\d+)/.exec(await page.textContent('#pCount')) || [0, 0])[1];
+const slideBefore = await slideNo();
+await fakeKey('ArrowRight');
+await wait(800);
+check((await slideNo()) === slideBefore + 1, '…but they can still turn pages (clickers and the deck itself)', `${slideBefore} → ${await slideNo()}`);
+app.off('window', onWin);
+await page.keyboard.press('Escape');
+await wait(1500);
+
+// Ending the show while it is still loading leaves the editor working.
+audP = app.waitForEvent('window', { timeout: 15000 });
+await page.click('#presentBtn');
+await page.waitForSelector('#presenter:not([hidden])');
+await page.keyboard.press('Escape');
+await audP.catch(() => null);
+await wait(2500);
+const editorOk = await page.isVisible('#workspace') && !!mainFrame() && await mainFrame().evaluate(() => !!(window.__hp && window.__hp.slides.length)).catch(() => false);
+check(editorOk, 'ending a show right after starting it leaves the editor with the deck loaded');
 
 /* ------------------------------------------------- two slide commands in a row */
 
@@ -340,8 +476,72 @@ await menu('slide-up');
 await wait(2000);
 const t = await page.$eval('#toast', (el) => (el.hidden ? '' : el.className + ' ' + el.textContent));
 check(!/error/.test(t), 'slides can still be moved afterwards', t.slice(0, 80));
-await menu('save'); // otherwise closing the app asks whether to save
+await menu('save');
+await wait(1000);
+
+/* ----------------------------------------- stable slide ids, text for Claude */
+
+const beforeIds = fs.readFileSync(deck, 'utf8');
+await menu('slide-ids');
+await page.waitForFunction(() => !document.querySelector('#stage.sv-loading'), null, { timeout: 20000 });
+await wait(1500);
+const sids = await mainFrame().evaluate(() => [...document.querySelectorAll('[data-hp-slide]')].map((x) => x.getAttribute('data-slide-id')));
+check(sids.length > 1 && sids.every(Boolean) && new Set(sids).size === sids.length, 'Ge slides fasta id gives every slide a unique id', sids.slice(0, 4).join(', '));
+await menu('save');
+await wait(1000);
+const withIds = fs.readFileSync(deck, 'utf8');
+check(withIds !== beforeIds && withIds.replace(/ data-slide-id="[^"]*"/g, '') === beforeIds, 'the ids are the only change in the saved file');
+
+await page.click('#thumbList li:nth-child(3)');
+await wait(400);
+await menu('copy-slide');
+await wait(600);
+const clip = await clipboardText();
+check(/^Slide 3 av \d+ · ”.+” · id: [a-z0-9-]+\n/.test(clip) && clip.includes(deck) && clip.includes('```html') && !/data-hp-id/.test(clip),
+  'Kopiera slide för Claude copies the slide source, notes and file path', clip.split('\n')[0]);
+await menu('copy-deck:qa');
+await wait(1000);
+const clip2 = await clipboardText();
+check(clip2.startsWith('Här är mitt deck.') && /\n## 1\. /.test(clip2) && /budget ~/.test(clip2) && !/data-hp-id|base64,[A-Za-z0-9+/]{200}/.test(clip2), 'Kopiera decket för Claude gives a text outline with the request first', `${clip2.length} chars`);
+
+/* ------------------------------------------------------------ versions */
+
+await menu('versions');
+await page.waitForSelector('#versionsDlg:not([hidden])');
+const rows = await page.$$eval('#verList li', (l) => l.map((x) => x.textContent));
+check(rows.length >= 3 && rows.some((r) => /Öppnad/.test(r)) && rows.some((r) => /Sparad/.test(r)) && rows.some((r) => /Ändrad utanför appen/.test(r)),
+  'every version the app saw is kept (opened, saved, changed outside the app)', `${rows.length} versions`);
+await shot(page, '7-versions');
+page.once('dialog', (d) => d.accept());
+const oldest = (await page.$$('#verList li')).pop();
+await (await oldest.$('button.primary')).click();
+await page.waitForSelector('#versionsDlg', { state: 'hidden', timeout: 10000 }).catch(() => {});
+await wait(1500);
+check(fs.readFileSync(deck, 'utf8') === original, 'restoring the oldest version gives back the file as it was opened');
+await page.waitForFunction(() => !document.querySelector('#stage.sv-loading'), null, { timeout: 20000 });
 await wait(800);
+
+/* -------------------------------------------------------- fonts without network */
+
+const fontHref = await mainFrame().evaluate(() => { const l = document.querySelector('link[rel="stylesheet"][href*="/__fonts/css"]'); return l ? l.href : null; });
+check(!!fontHref && fontHref.startsWith('hpres://deck/__fonts/css?u=') && fs.readFileSync(deck, 'utf8').includes('href="https://fonts.googleapis.com/'),
+  'Google Fonts load through the app; the file itself is unchanged', String(fontHref).slice(0, 50));
+const fontOnline = fontHref ? await mainFrame().evaluate((h) => fetch(h).then((r) => r.status, () => 0), fontHref) : 0;
+if (fontOnline === 200) {
+  await clickMenuItem('Testa utan nät');
+  await page.waitForSelector('#offlineMark:not([hidden])');
+  await page.waitForFunction(() => !document.querySelector('#stage.sv-loading'), null, { timeout: 20000 });
+  await wait(2500);
+  const off = await mainFrame().evaluate((h) => fetch(h).then((r) => r.status, () => 0), fontHref);
+  const ext = await mainFrame().evaluate(() => fetch('https://example.com/?hp-test', { mode: 'no-cors' }).then(() => 'online', () => 'blocked'));
+  check(off === 200 && ext === 'blocked', 'with Testa utan nät on, other requests fail but the saved fonts still load', `${off}, ${ext}`);
+  await clickMenuItem('Testa utan nät');
+  await page.waitForSelector('#offlineMark', { state: 'hidden' });
+  await page.waitForFunction(() => !document.querySelector('#stage.sv-loading'), null, { timeout: 20000 });
+  await wait(1500);
+} else {
+  console.log('  (skipped the offline font check: Google Fonts could not be reached)');
+}
 
 await app.close();
 console.log(failures ? `\n${failures} check(s) failed` : '\nAll checks passed');
