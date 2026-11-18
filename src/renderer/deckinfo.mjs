@@ -28,5 +28,14 @@ export function cleanInfo(info) {
     slideTag: /^[a-z][a-z0-9-]{0,40}$/.test(info.slideTag || '') ? info.slideTag : '',
     commonClasses: (Array.isArray(info.commonClasses) ? info.commonClasses : []).filter((c) => typeof c === 'string' && /^[\w-]{1,80}$/.test(c)).slice(0, 20),
     jsonNotes: !!info.jsonNotes,
+    slideIds: Array.from({ length: whole ? 0 : count }, (_, i) => {
+      const v = Array.isArray(info.slideIds) ? info.slideIds[i] : '';
+      return typeof v === 'string' && /^[A-Za-z0-9][\w-]{0,63}$/.test(v) ? v : '';
+    }),
   };
+}
+
+// Det decket svarar på 'outline': en kort text per slide.
+export function cleanOutline(list, count) {
+  return Array.from({ length: count }, (_, i) => (Array.isArray(list) && typeof list[i] === 'string' ? list[i].slice(0, 4000) : ''));
 }

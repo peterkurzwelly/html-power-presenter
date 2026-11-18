@@ -216,3 +216,54 @@ li.dragging { opacity: .35; }
 .imp-opts p { flex-basis: 100%; margin: 0; }
 .small { font-size: 12px; }
 .imp-actions { display: flex; gap: 8px; }
+
+/* ------------------------------------------------- timer, mål och tempo */
+.p-timer { position: relative; gap: 10px; }
+button.p-time { background: none; border: 0; padding: 0; color: var(--text); cursor: pointer; text-align: left; -webkit-app-region: no-drag; }
+.p-time.warn { color: var(--warn); }
+.p-time.over { color: var(--danger); }
+.p-time.paused { color: var(--warn); opacity: .75; }
+.p-timer-side { display: flex; flex-direction: column; gap: 2px; }
+.p-timer-sub { font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.p-timer-btns { display: flex; gap: 4px; }
+.p-timer-btns .icon-btn { padding: 1px 7px; font-size: 12px; }
+.p-pop { position: absolute; top: 50px; left: 0; z-index: 40; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; background: #15171b; border: 1px solid var(--line-2); border-radius: 10px; box-shadow: 0 12px 34px rgba(0,0,0,.55); -webkit-app-region: no-drag; min-width: 210px; }
+.p-pop label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--text-3); }
+.p-pop-row { display: flex; align-items: center; gap: 8px; }
+.p-pop input { width: 80px; background: var(--bg-3); color: var(--text); border: 1px solid var(--line-2); border-radius: 6px; padding: 4px 8px; font: 600 16px ui-monospace, Menlo, monospace; }
+.p-countbox { display: flex; flex-direction: column; gap: 3px; }
+.p-pace { font-size: 12px; color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.p-pace .ahead { color: var(--ok); }
+.p-pace .behind { color: var(--danger); }
+.p-pace .on { color: var(--text-2); }
+.p-pace .long { color: var(--warn); }
+.p-chip { -webkit-app-region: no-drag; display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 12px; border-radius: 8px; background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.5); color: #fcd34d; font-size: 12px; }
+
+/* ----------------------------------------- nästa slide som bild */
+.p-next-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 2px; outline: 1px solid #26292e; background: #000; }
+.p-next-ph { display: grid; place-items: center; color: var(--text-3); font-size: 13px; text-align: center; padding: 10px; background: repeating-linear-gradient(135deg, #121316 0 10px, #15161a 10px 20px); outline: 1px solid #26292e; }
+
+/* ----------------------------------------- smalt presentatörsfönster (fönsterläge) */
+@media (max-width: 1180px) {
+  .p-top { gap: 10px; padding: 0 12px; }
+  .p-top .btn { padding: 4px 8px; }
+  .p-time { min-width: 76px; font-size: 22px; }
+  .p-main { gap: 12px; padding: 12px; }
+  .p-side { min-width: 220px; }
+}
+@media (max-width: 980px) {
+  .p-clock { display: none; }
+  #pGridBtn, #pSwap { display: none; }
+}
+
+/* ---------------------------------------------------- utan nät */
+.dirty.offline { background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.55); color: #fca5a5; }
+
+/* ------------------------------------------------- versioner */
+.versions-box { width: min(760px, 100%); height: min(640px, 100%); }
+.ver-list { list-style: none; margin: 0; padding: 6px 12px 16px; overflow: auto; flex: 1; border-top: 1px solid var(--line); }
+.ver-list li { display: grid; grid-template-columns: 1fr auto auto auto; gap: 12px; align-items: center; padding: 10px; border-bottom: 1px solid var(--line); }
+.ver-list .v-when { font-weight: 600; font-variant-numeric: tabular-nums; }
+.ver-list .v-meta { color: var(--text-3); font-size: 12px; }
+.ver-list .v-cur { color: var(--ok); font-size: 12px; }
+.ver-empty { color: var(--text-2); padding: 30px; text-align: center; }

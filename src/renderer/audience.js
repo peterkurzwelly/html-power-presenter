@@ -6,7 +6,9 @@ const cover = document.getElementById('cover');
 let loading = null;
 
 const forward = (k) => hp.audienceKey(k);
-view.on('key', forward);
+// Tangenter som kommer inifrån decket kan lika gärna komma från deckets eget skript,
+// så de märks och får bara bläddra, släcka och avsluta (se handleKey i app.js).
+view.on('key', (k) => { if (k && typeof k.key === 'string') forward({ ...k, viaDeck: true }); });
 document.addEventListener('keydown', (e) => {
   if (e.metaKey || e.ctrlKey) return;
   e.preventDefault();
